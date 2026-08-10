@@ -1,0 +1,127 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ResourceInventoryReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeRegions",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeVolumesModifications",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeImages",
+        "ec2:DescribeAddresses",
+        "ec2:DescribeNatGateways",
+        "ec2:DescribeReservedInstances",
+        "autoscaling:DescribeAutoScalingGroups",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth",
+        "elasticloadbalancing:DescribeTags",
+        "eks:ListClusters",
+        "eks:DescribeCluster",
+        "eks:ListNodegroups",
+        "eks:DescribeNodegroup",
+        "eks:ListFargateProfiles",
+        "eks:DescribeFargateProfile",
+        "rds:DescribeDBInstances",
+        "rds:DescribeDBClusters",
+        "rds:DescribeDBSnapshots",
+        "rds:ListTagsForResource",
+        "s3:ListAllMyBuckets",
+        "s3:GetBucketLocation",
+        "s3:GetBucketTagging",
+        "s3:GetLifecycleConfiguration",
+        "s3:GetIntelligentTieringConfiguration",
+        "s3:ListBucketMultipartUploads",
+        "lambda:ListFunctions",
+        "lambda:ListTags",
+        "dynamodb:ListTables",
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeContinuousBackups",
+        "dynamodb:ListTagsOfResource",
+        "logs:DescribeLogGroups",
+        "logs:ListTagsForResource",
+        "tag:GetResources",
+        "tag:GetTagKeys"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CostAndUsageReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetCostAndUsageWithResources",
+        "ce:GetCostForecast",
+        "ce:GetDimensionValues",
+        "ce:GetTags",
+        "ce:GetReservationCoverage",
+        "ce:GetReservationUtilization",
+        "ce:GetReservationPurchaseRecommendation",
+        "ce:GetSavingsPlansCoverage",
+        "ce:GetSavingsPlansUtilization",
+        "ce:GetSavingsPlansUtilizationDetails",
+        "ce:GetSavingsPlansPurchaseRecommendation",
+        "ce:ListCostAllocationTags",
+        "pricing:GetProducts",
+        "pricing:DescribeServices",
+        "pricing:GetAttributeValues"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OptimizationRecommendationsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "compute-optimizer:GetEnrollmentStatus",
+        "compute-optimizer:GetEC2InstanceRecommendations",
+        "compute-optimizer:GetAutoScalingGroupRecommendations",
+        "compute-optimizer:GetEBSVolumeRecommendations",
+        "compute-optimizer:GetLambdaFunctionRecommendations",
+        "compute-optimizer:GetRDSDatabaseRecommendations",
+        "compute-optimizer:GetIdleRecommendations",
+        "cost-optimization-hub:ListEnrollmentStatuses",
+        "cost-optimization-hub:GetPreferences",
+        "cost-optimization-hub:ListRecommendations",
+        "cost-optimization-hub:ListRecommendationSummaries",
+        "cost-optimization-hub:GetRecommendation",
+        "support:DescribeTrustedAdvisorChecks",
+        "support:DescribeTrustedAdvisorCheckResult",
+        "trustedadvisor:ListChecks",
+        "trustedadvisor:ListRecommendations",
+        "trustedadvisor:GetRecommendation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "MetricsReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricData",
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:ListMetrics"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IdentityReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "sts:GetCallerIdentity",
+        "iam:ListAccountAliases",
+        "organizations:DescribeOrganization",
+        "organizations:ListAccounts"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "BedrockAdvisorOptional",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel"],
+      "Resource": "*"
+    }
+  ]
+}
