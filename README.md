@@ -34,7 +34,8 @@ finops serve                      # http://127.0.0.1:8000
 
 `--dry-run` scans a realistic mock account, so you can exercise every rule, the report,
 and the whole dashboard before pointing anything at AWS. Cost and utilization figures in
-a dry run are synthetic and the scan says so, in the UI and in the CLI output.
+a dry run are synthetic and the scan says so, in the UI and in the CLI output. When you no
+longer need them, `finops prune --demo` clears them out.
 
 ### Pointing it at a real account
 
@@ -75,7 +76,7 @@ dashboard reads only from there.
 | `finops report [scan_id]` | Print a stored scan (`latest` by default, `--json` for raw) |
 | `finops scans` | List stored scans |
 | `finops advise [scan_id]` | Re-run only the LLM layer against a stored scan |
-| `finops prune --keep 10` | Delete old scans |
+| `finops prune` | Delete stored scans: `--keep N` by age, `--demo` for dry-run scans, `--empty` for runs that collected nothing, `--id` for one specific scan |
 | `finops serve` | Serve the API and, if built, the dashboard |
 | `finops policy` | Print the read-only IAM policy |
 

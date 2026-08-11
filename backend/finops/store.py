@@ -29,7 +29,7 @@ from finops.model import (
     TcoReport,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS scans (
     identified_monthly_savings REAL NOT NULL DEFAULT 0,
     tco_json TEXT,
     advice_json TEXT,
-    notes_json TEXT NOT NULL DEFAULT '[]'
+    notes_json TEXT NOT NULL DEFAULT '[]',
+    dry_run INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS resources (
@@ -153,6 +154,7 @@ class ScanStore:
             # WAL lets the dashboard read while a scan writes.
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     # ------------------------------------------------------------------ writes
@@ -167,8 +169,8 @@ class ScanStore:
                     scan_id, account_id, account_alias, started_at, finished_at,
                     duration_seconds, regions_json, resource_count, finding_count,
                     monthly_run_rate, identified_monthly_savings, tco_json, advice_json,
-                    notes_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    notes_json, dry_run
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     scan.scan_id,
@@ -185,6 +187,7 @@ class ScanStore:
                     scan.tco.model_dump_json() if scan.tco else None,
                     scan.advice.model_dump_json() if scan.advice else None,
                     _dumps([n.model_dump(mode="json") for n in scan.notes]),
+                    int(scan.dry_run),
                 ),
             )
             conn.executemany(
@@ -292,6 +295,16 @@ class ScanStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM scans WHERE scan_id = ?", (scan_id,))
 
+    def delete_scans(self, scan_ids: Sequence[str]) -> int:
+        """Delete the named scans. Returns how many rows actually went away."""
+        if not scan_ids:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.executemany(
+                "DELETE FROM scans WHERE scan_id = ?", [(scan_id,) for scan_id in scan_ids]
+            )
+            return cursor.rowcount if cursor.rowcount > 0 else 0
+
     def prune(self, keep: int) -> int:
         """Drop all but the ``keep`` most recent scans. Returns the number removed."""
         with self._connect() as conn:
@@ -369,6 +382,7 @@ class ScanStore:
             notes=[
                 CapabilityNote.model_validate(n) for n in json.loads(head["notes_json"] or "[]")
             ],
+            dry_run=bool(head["dry_run"]),
         )
 
     def get_tco(self, scan_id: str) -> TcoReport | None:
@@ -529,6 +543,20 @@ class ScanStore:
         return [row["v"] for row in rows]
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing database up to the current schema.
+
+    Additive only. The store is a history of past runs: worth keeping, never worth
+    rebuilding from scratch because a column was added.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(scans)")}
+    if "dry_run" not in columns:
+        conn.execute("ALTER TABLE scans ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0")
+        # Demo scans written before the column existed are recognizable by the alias the
+        # mocked account carries.
+        conn.execute("UPDATE scans SET dry_run = 1 WHERE account_alias LIKE '%dry run%'")
+
+
 def _row_to_meta(row: sqlite3.Row) -> ScanMeta:
     return ScanMeta(
         scan_id=row["scan_id"],
@@ -542,6 +570,7 @@ def _row_to_meta(row: sqlite3.Row) -> ScanMeta:
         finding_count=row["finding_count"],
         monthly_run_rate=row["monthly_run_rate"],
         identified_monthly_savings=row["identified_monthly_savings"],
+        dry_run=bool(row["dry_run"]),
     )
 
 

@@ -128,6 +128,7 @@ export interface ScanMeta {
   finding_count: number;
   monthly_run_rate: number;
   identified_monthly_savings: number;
+  dry_run: boolean;
 }
 
 export interface ScanDetail {

@@ -3,7 +3,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { dateTime, money, relativeTime } from "@/lib/format";
 import { useScanContext } from "@/state/ScanContext";
 
-import { Button, Select, Spinner, cx } from "./ui";
+import { Badge, Button, Select, Spinner, cx } from "./ui";
 
 const NAV = [
   { to: "/", label: "Overview", end: true },
@@ -68,11 +68,16 @@ export default function Layout() {
           <div className="min-w-0">
             {scan?.tco ? (
               <>
-                <p className="tabular text-sm font-medium text-ink">
+                <p className="tabular flex items-center gap-2 text-sm font-medium text-ink">
                   {money(scan.tco.monthly_run_rate)}/mo run rate
-                  <span className="ml-2 font-normal text-good">
+                  <span className="font-normal text-good">
                     {money(scan.tco.identified_monthly_savings)}/mo identified
                   </span>
+                  {scan.meta?.dry_run && (
+                    <Badge tone="warn" title="Synthetic data from finops scan --dry-run">
+                      Demo data
+                    </Badge>
+                  )}
                 </p>
                 <p className="text-xs text-ink-faint">
                   {scan.tco.period_start} to {scan.tco.period_end} · {scan.tco.metric}
@@ -98,7 +103,9 @@ export default function Layout() {
                   { value: "latest", label: "Latest scan" },
                   ...scans.map((meta) => ({
                     value: meta.scan_id,
-                    label: `${dateTime(meta.started_at)} · ${money(meta.monthly_run_rate)}/mo`,
+                    label:
+                      `${dateTime(meta.started_at)} · ${money(meta.monthly_run_rate)}/mo` +
+                      (meta.dry_run ? " · demo" : ""),
                   })),
                 ]}
               />

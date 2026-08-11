@@ -169,6 +169,7 @@ def run_demo_scan(
             costs=snapshot.records,
             findings=findings,
             notes=notes.notes,
+            dry_run=True,
         )
         scan.tco = build_tco_report(snapshot, findings, resources)
 

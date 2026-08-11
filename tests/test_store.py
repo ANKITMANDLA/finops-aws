@@ -144,6 +144,71 @@ def test_trend_returns_scans_oldest_first_and_prune_keeps_recent(tmp_path):
     assert {m.scan_id for m in store.list_scans()} == {"scan-3", "scan-4"}
 
 
+def test_dry_run_scans_are_marked_as_such(tmp_path):
+    """A demo scan must never be mistaken for a real bill after a round trip."""
+    store = ScanStore(tmp_path / "finops.db")
+    demo = make_scan("scan-demo")
+    demo.dry_run = True
+    store.save_scan(demo)
+    store.save_scan(make_scan("scan-live"))
+
+    by_id = {m.scan_id: m for m in store.list_scans()}
+    assert by_id["scan-demo"].dry_run is True
+    assert by_id["scan-live"].dry_run is False
+    loaded = store.get_scan("scan-demo")
+    assert loaded is not None and loaded.dry_run is True
+
+
+def test_delete_scans_removes_only_the_named_ones(tmp_path):
+    store = ScanStore(tmp_path / "finops.db")
+    for index in range(3):
+        store.save_scan(make_scan(f"scan-{index}"))
+
+    assert store.delete_scans(["scan-0", "scan-2"]) == 2
+    assert [m.scan_id for m in store.list_scans()] == ["scan-1"]
+    assert store.delete_scans([]) == 0
+
+
+def test_an_older_database_gains_the_dry_run_column(tmp_path):
+    """Upgrading must not require throwing away scan history."""
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE scans (
+            scan_id TEXT PRIMARY KEY,
+            account_id TEXT NOT NULL,
+            account_alias TEXT,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_seconds REAL NOT NULL DEFAULT 0,
+            regions_json TEXT NOT NULL DEFAULT '[]',
+            resource_count INTEGER NOT NULL DEFAULT 0,
+            finding_count INTEGER NOT NULL DEFAULT 0,
+            monthly_run_rate REAL NOT NULL DEFAULT 0,
+            identified_monthly_savings REAL NOT NULL DEFAULT 0,
+            tco_json TEXT,
+            advice_json TEXT,
+            notes_json TEXT NOT NULL DEFAULT '[]'
+        );
+        INSERT INTO scans (scan_id, account_id, account_alias, started_at)
+            VALUES ('old-demo', '123456789012', 'demo (dry run)', '2026-08-01T00:00:00+00:00');
+        INSERT INTO scans (scan_id, account_id, account_alias, started_at)
+            VALUES ('old-live', '111122223333', 'prod', '2026-08-02T00:00:00+00:00');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    by_id = {m.scan_id: m for m in ScanStore(path).list_scans()}
+
+    # The demo scan predates the column, so it is recognized by the alias it carries.
+    assert by_id["old-demo"].dry_run is True
+    assert by_id["old-live"].dry_run is False
+
+
 def test_distinct_values_rejects_unknown_columns(tmp_path):
     store = ScanStore(tmp_path / "finops.db")
     store.save_scan(make_scan(resources=[make_resource(), make_resource("vol-a", service="EBS")]))

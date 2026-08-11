@@ -280,6 +280,12 @@ class ScanMeta(BaseModel):
     finding_count: int = 0
     monthly_run_rate: float = 0.0
     identified_monthly_savings: float = 0.0
+    dry_run: bool = False
+
+    @property
+    def is_empty(self) -> bool:
+        """A scan that collected nothing: usually a run that died on permissions."""
+        return self.resource_count == 0
 
 
 class Scan(BaseModel):
@@ -298,6 +304,9 @@ class Scan(BaseModel):
     tco: TcoReport | None = None
     advice: Advice | None = None
     notes: list[CapabilityNote] = Field(default_factory=list)
+    # Produced by ``finops scan --dry-run`` against a mocked account. Persisted so the
+    # dashboard can label it and so it can never be mistaken for a real bill.
+    dry_run: bool = False
 
     @property
     def meta(self) -> ScanMeta:
@@ -309,6 +318,7 @@ class Scan(BaseModel):
             finished_at=self.finished_at,
             duration_seconds=self.duration_seconds,
             regions=self.regions,
+            dry_run=self.dry_run,
             resource_count=len(self.resources),
             finding_count=len(self.findings),
             monthly_run_rate=self.tco.monthly_run_rate if self.tco else 0.0,

@@ -181,20 +181,31 @@ def scans(limit: int = typer.Option(20, "--limit", "-n")) -> None:
     table = Table(title="Scan history")
     table.add_column("Scan id")
     table.add_column("Started")
+    table.add_column("Kind")
     table.add_column("Resources", justify="right")
     table.add_column("Findings", justify="right")
     table.add_column("Run rate/mo", justify="right")
     table.add_column("Savings/mo", justify="right")
     for meta in history:
+        if meta.dry_run:
+            kind = "[magenta]demo[/magenta]"
+        elif meta.is_empty:
+            kind = "[yellow]empty[/yellow]"
+        else:
+            kind = "live"
         table.add_row(
             meta.scan_id,
             meta.started_at.strftime("%Y-%m-%d %H:%M"),
+            kind,
             str(meta.resource_count),
             str(meta.finding_count),
             human_money(meta.monthly_run_rate),
             human_money(meta.identified_monthly_savings),
         )
     console.print(table)
+    console.print(
+        "[dim]finops prune --demo --empty removes the demo and failed runs.[/dim]",
+    )
 
 
 @app.command()
@@ -220,10 +231,69 @@ def advise(
 
 
 @app.command()
-def prune(keep: int = typer.Option(10, "--keep", "-k", help="Scans to retain.")) -> None:
-    """Delete old scans, keeping the most recent ones."""
-    removed = ScanStore(get_settings().db_path).prune(keep)
-    console.print(f"Removed {removed} scan(s), kept {keep}.")
+def prune(
+    keep: int | None = typer.Option(
+        None, "--keep", "-k", help="Retain this many of the most recent scans, drop the rest."
+    ),
+    demo: bool = typer.Option(False, "--demo", help="Drop scans produced by --dry-run."),
+    empty: bool = typer.Option(
+        False, "--empty", help="Drop scans that collected nothing, usually a failed run."
+    ),
+    scan_ids: list[str] = typer.Option([], "--id", help="Drop a specific scan. Repeatable."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Delete stored scans, by age, by kind, or by id.
+
+    With no options this keeps the 10 most recent scans, which is the old behaviour.
+    """
+    store = ScanStore(get_settings().db_path)
+    selective = demo or empty or scan_ids
+    if not selective and keep is None:
+        keep = 10
+
+    history = store.list_scans(limit=10_000)
+    doomed: dict[str, str] = {}
+    if demo:
+        doomed.update({m.scan_id: "demo" for m in history if m.dry_run})
+    if empty:
+        doomed.update({m.scan_id: "empty" for m in history if m.is_empty})
+    for scan_id in scan_ids:
+        resolved = store.resolve_scan_id(scan_id)
+        if resolved is None or store.get_scan_meta(resolved) is None:
+            console.print(f"[yellow]No scan {scan_id}; skipping.[/yellow]")
+            continue
+        doomed[resolved] = "requested"
+    if keep is not None:
+        # Age applies to whatever the other filters left behind, so --demo --keep 5 means
+        # "drop the demos, then keep the 5 newest of what remains".
+        survivors = [m for m in history if m.scan_id not in doomed]
+        doomed.update({m.scan_id: "old" for m in survivors[keep:]})
+
+    if not doomed:
+        console.print("Nothing to prune.")
+        return
+
+    table = Table(title=f"{len(doomed)} scan(s) to delete")
+    table.add_column("Scan id")
+    table.add_column("Started")
+    table.add_column("Reason")
+    table.add_column("Resources", justify="right")
+    for meta in history:
+        if meta.scan_id in doomed:
+            table.add_row(
+                meta.scan_id,
+                meta.started_at.strftime("%Y-%m-%d %H:%M"),
+                doomed[meta.scan_id],
+                str(meta.resource_count),
+            )
+    console.print(table)
+
+    if not yes and not typer.confirm("Delete these scans?"):
+        console.print("Left alone.")
+        return
+
+    removed = store.delete_scans(list(doomed))
+    console.print(f"Removed {removed} scan(s); {len(history) - removed} remain.")
 
 
 @app.command()

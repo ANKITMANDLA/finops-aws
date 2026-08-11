@@ -21,7 +21,10 @@ frontend/.vite/
 
 # Local state and secrets
 .artifacts/
-.env
+# Every .env variant is local, including stray editor copies. The template is the one
+# file here that belongs in the repo.
+.env*
+!.env.example
 data/
 *.db
 *.db-journal
