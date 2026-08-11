@@ -12,7 +12,9 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
+from finops.agent.types import ChatMessage, ProviderTurn, ToolCall, ToolSpec
 from finops.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -29,9 +31,10 @@ class ProviderUnavailable(ProviderError):
 
 
 class LlmProvider(ABC):
-    """Minimal text-completion interface shared by every backend."""
+    """Text completion, plus optional tool use, shared by every backend."""
 
     name: str = "none"
+    supports_tools: bool = False
 
     def __init__(self, model: str, *, max_tokens: int = 4096, temperature: float = 0.2) -> None:
         self.model = model
@@ -41,6 +44,19 @@ class LlmProvider(ABC):
     @abstractmethod
     def complete(self, system: str, user: str) -> str:
         """Return the model's text response, or raise ``ProviderError``."""
+
+    def converse(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+    ) -> ProviderTurn:
+        """Continue a conversation, optionally calling tools.
+
+        The caller runs any returned tool calls and sends the results back as another
+        message, so this stays a single request rather than owning the loop.
+        """
+        raise ProviderUnavailable(f"The {self.name} provider does not support conversations.")
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<{type(self).__name__} model={self.model}>"
@@ -66,26 +82,92 @@ class BedrockProvider(LlmProvider):
     """Amazon Bedrock via the Converse API, which is uniform across model families."""
 
     name = "bedrock"
+    supports_tools = True
 
     def __init__(self, client, model: str, **kwargs) -> None:
         super().__init__(model, **kwargs)
         self._client = client
 
     def complete(self, system: str, user: str) -> str:
-        try:
-            response = self._client.converse(
-                modelId=self.model,
-                system=[{"text": system}],
-                messages=[{"role": "user", "content": [{"text": user}]}],
-                inferenceConfig={
-                    "maxTokens": self.max_tokens,
-                    "temperature": self.temperature,
-                },
-            )
-        except Exception as exc:  # boto3 raises ClientError and friends
-            raise _translate_bedrock_error(exc) from exc
+        response = self._call([{"role": "user", "content": [{"text": user}]}], system, ())
         blocks = response.get("output", {}).get("message", {}).get("content", [])
         return "".join(block.get("text", "") for block in blocks).strip()
+
+    def converse(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+    ) -> ProviderTurn:
+        response = self._call([_bedrock_message(message) for message in messages], system, tools)
+        blocks = response.get("output", {}).get("message", {}).get("content", [])
+
+        text_parts, calls = [], []
+        for block in blocks:
+            if "text" in block:
+                text_parts.append(block["text"])
+            elif "toolUse" in block:
+                use = block["toolUse"]
+                calls.append(
+                    ToolCall(
+                        id=use.get("toolUseId", f"call-{len(calls)}"),
+                        name=use.get("name", ""),
+                        arguments=use.get("input") or {},
+                    )
+                )
+        return ProviderTurn(text="".join(text_parts).strip(), tool_calls=calls)
+
+    def _call(self, messages: list[dict], system: str, tools: Sequence[ToolSpec]) -> dict:
+        request = {
+            "modelId": self.model,
+            "system": [{"text": system}],
+            "messages": messages,
+            "inferenceConfig": {"maxTokens": self.max_tokens, "temperature": self.temperature},
+        }
+        if tools:
+            request["toolConfig"] = {
+                "tools": [
+                    {
+                        "toolSpec": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "inputSchema": {"json": tool.input_schema},
+                        }
+                    }
+                    for tool in tools
+                ]
+            }
+        try:
+            return self._client.converse(**request)
+        except Exception as exc:  # boto3 raises ClientError and friends
+            raise _translate_bedrock_error(exc) from exc
+
+
+def _bedrock_message(message: ChatMessage) -> dict:
+    if message.role == "tool":
+        # Bedrock has no tool role: results are user content blocks.
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": result.call_id,
+                        "content": [{"text": result.content}],
+                        "status": "error" if result.is_error else "success",
+                    }
+                }
+                for result in message.tool_results
+            ],
+        }
+
+    content: list[dict] = []
+    if message.content:
+        content.append({"text": message.content})
+    for call in message.tool_calls:
+        content.append(
+            {"toolUse": {"toolUseId": call.id, "name": call.name, "input": call.arguments}}
+        )
+    return {"role": message.role, "content": content or [{"text": ""}]}
 
 
 class AnthropicProvider(LlmProvider):
@@ -94,6 +176,7 @@ class AnthropicProvider(LlmProvider):
     name = "anthropic"
     endpoint = "https://api.anthropic.com/v1/messages"
     api_version = "2023-06-01"
+    supports_tools = True
 
     def __init__(self, api_key: str, model: str, *, http_client=None, **kwargs) -> None:
         super().__init__(model, **kwargs)
@@ -101,29 +184,93 @@ class AnthropicProvider(LlmProvider):
         self._http = http_client
 
     def complete(self, system: str, user: str) -> str:
+        data = self._call(system, [{"role": "user", "content": user}], ())
+        blocks = data.get("content", [])
+        return "".join(
+            block.get("text", "") for block in blocks if block.get("type", "text") == "text"
+        ).strip()
+
+    def converse(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+    ) -> ProviderTurn:
+        data = self._call(system, [_anthropic_message(message) for message in messages], tools)
+
+        text_parts, calls = [], []
+        for block in data.get("content", []):
+            kind = block.get("type", "text")
+            if kind == "text":
+                text_parts.append(block.get("text", ""))
+            elif kind == "tool_use":
+                calls.append(
+                    ToolCall(
+                        id=block.get("id", f"call-{len(calls)}"),
+                        name=block.get("name", ""),
+                        arguments=block.get("input") or {},
+                    )
+                )
+        return ProviderTurn(text="".join(text_parts).strip(), tool_calls=calls)
+
+    def _call(self, system: str, messages: list[dict], tools: Sequence[ToolSpec]) -> dict:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
             "system": system,
-            "messages": [{"role": "user", "content": user}],
+            "messages": messages,
         }
+        if tools:
+            payload["tools"] = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                }
+                for tool in tools
+            ]
         headers = {
             "x-api-key": self._api_key,
             "anthropic-version": self.api_version,
             "content-type": "application/json",
         }
-        data = _post_json(self._http, self.endpoint, payload, headers)
-        blocks = data.get("content", [])
-        return "".join(
-            block.get("text", "") for block in blocks if block.get("type", "text") == "text"
-        ).strip()
+        return _post_json(self._http, self.endpoint, payload, headers)
+
+
+def _anthropic_message(message: ChatMessage) -> dict:
+    if message.role == "tool":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": result.call_id,
+                    "content": result.content,
+                    "is_error": result.is_error,
+                }
+                for result in message.tool_results
+            ],
+        }
+
+    if not message.tool_calls:
+        return {"role": message.role, "content": message.content}
+
+    content: list[dict] = []
+    if message.content:
+        content.append({"type": "text", "text": message.content})
+    for call in message.tool_calls:
+        content.append(
+            {"type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments}
+        )
+    return {"role": message.role, "content": content}
 
 
 class OpenAiProvider(LlmProvider):
     """OpenAI chat completions, and by extension any API-compatible endpoint."""
 
     name = "openai"
+    supports_tools = True
 
     def __init__(
         self, api_key: str, model: str, *, base_url: str, http_client=None, **kwargs
@@ -134,15 +281,53 @@ class OpenAiProvider(LlmProvider):
         self._http = http_client
 
     def complete(self, system: str, user: str) -> str:
+        message = self._call(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}], ()
+        )
+        return (message.get("content") or "").strip()
+
+    def converse(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+    ) -> ProviderTurn:
+        wire: list[dict] = [{"role": "system", "content": system}]
+        for message in messages:
+            wire.extend(_openai_messages(message))
+        reply = self._call(wire, tools)
+
+        calls = []
+        for index, call in enumerate(reply.get("tool_calls") or []):
+            function = call.get("function") or {}
+            calls.append(
+                ToolCall(
+                    id=call.get("id", f"call-{index}"),
+                    name=function.get("name", ""),
+                    arguments=_loads_arguments(function.get("arguments")),
+                )
+            )
+        return ProviderTurn(text=(reply.get("content") or "").strip(), tool_calls=calls)
+
+    def _call(self, messages: list[dict], tools: Sequence[ToolSpec]) -> dict:
         payload = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "messages": messages,
         }
+        if tools:
+            payload["tools"] = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                }
+                for tool in tools
+            ]
         headers = {
             "Authorization": f"Bearer {self._api_key}",
             "content-type": "application/json",
@@ -151,7 +336,39 @@ class OpenAiProvider(LlmProvider):
         choices = data.get("choices") or []
         if not choices:
             raise ProviderError("OpenAI returned no choices")
-        return (choices[0].get("message", {}).get("content") or "").strip()
+        return choices[0].get("message", {})
+
+
+def _openai_messages(message: ChatMessage) -> list[dict]:
+    """OpenAI wants one message per tool result, so this can fan out."""
+    if message.role == "tool":
+        return [
+            {"role": "tool", "tool_call_id": result.call_id, "content": result.content}
+            for result in message.tool_results
+        ]
+
+    wire: dict = {"role": message.role, "content": message.content or None}
+    if message.tool_calls:
+        wire["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+            }
+            for call in message.tool_calls
+        ]
+    return [wire]
+
+
+def _loads_arguments(raw) -> dict:
+    """Tool arguments arrive as a JSON string, and a truncated one is not fatal."""
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 class GeminiProvider(LlmProvider):
@@ -162,6 +379,7 @@ class GeminiProvider(LlmProvider):
     """
 
     name = "gemini"
+    supports_tools = True
 
     def __init__(
         self,
@@ -180,25 +398,84 @@ class GeminiProvider(LlmProvider):
         self._http = http_client
 
     def complete(self, system: str, user: str) -> str:
-        config = {
-            "temperature": self.temperature,
-            "maxOutputTokens": self.max_tokens,
+        candidate = self._call(
+            system,
+            [{"role": "user", "parts": [{"text": user}]}],
+            (),
             # The advisor asks for JSON, and saying so here stops Gemini wrapping the
-            # object in prose or a markdown fence.
-            "responseMimeType": "application/json",
-        }
+            # object in prose or a markdown fence. Not valid alongside tools.
+            response_mime_type="application/json",
+        )
+        text = _gemini_text(candidate)
+        if not text:
+            raise ProviderError(
+                f"Gemini returned an empty response ({candidate.get('finishReason')})"
+            )
+        return text
+
+    def converse(
+        self,
+        system: str,
+        messages: Sequence[ChatMessage],
+        tools: Sequence[ToolSpec] = (),
+    ) -> ProviderTurn:
+        candidate = self._call(system, [_gemini_content(m) for m in messages], tools)
+
+        calls = []
+        for index, part in enumerate((candidate.get("content") or {}).get("parts", [])):
+            function_call = part.get("functionCall")
+            if not function_call:
+                continue
+            calls.append(
+                ToolCall(
+                    id=function_call.get("id") or f"call-{index}",
+                    name=function_call.get("name", ""),
+                    arguments=function_call.get("args") or {},
+                    # Gemini 3 rejects a follow-up turn whose function call came back
+                    # without the signature it issued: MISSING_THOUGHT_SIGNATURE.
+                    provider_data={key: part[key] for key in ("thoughtSignature",) if key in part},
+                )
+            )
+        return ProviderTurn(text=_gemini_text(candidate), tool_calls=calls)
+
+    def _call(
+        self,
+        system: str,
+        contents: list[dict],
+        tools: Sequence[ToolSpec],
+        *,
+        response_mime_type: str | None = None,
+    ) -> dict:
+        config: dict = {"temperature": self.temperature, "maxOutputTokens": self.max_tokens}
+        if response_mime_type:
+            config["responseMimeType"] = response_mime_type
         level = self._resolved_thinking_level()
         if level:
             # Thought tokens are billed against maxOutputTokens, and an unbounded reasoning
-            # budget on a long inventory truncates the JSON before it closes. The advisor's
-            # input is already ranked and summarized, so it needs very little deliberation.
+            # budget on a long inventory truncates the answer before it closes.
             config["thinkingConfig"] = {"thinkingLevel": level}
 
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "contents": contents,
             "generationConfig": config,
         }
+        if tools:
+            payload["tools"] = [
+                {
+                    "functionDeclarations": [
+                        {
+                            "name": tool.name,
+                            "description": tool.description,
+                            # Full JSON Schema, rather than the OpenAPI subset `parameters`
+                            # takes, so MCP schemas pass through unmodified.
+                            "parametersJsonSchema": tool.input_schema,
+                        }
+                        for tool in tools
+                    ]
+                }
+            ]
+
         headers = {"x-goog-api-key": self._api_key, "content-type": "application/json"}
         url = f"{self._base_url}/models/{self.model}:generateContent"
         data = _post_json(self._http, url, payload, headers)
@@ -211,20 +488,14 @@ class GeminiProvider(LlmProvider):
         if not candidates:
             raise ProviderError("Gemini returned no candidates")
         candidate = candidates[0]
-        reason = candidate.get("finishReason") or "unknown"
-        if reason == "MAX_TOKENS":
-            # Truncated JSON would otherwise reach the parser and be reported as a malformed
-            # response, which sends you looking in the wrong place.
+        if candidate.get("finishReason") == "MAX_TOKENS":
+            # Truncated output would otherwise reach the JSON parser and be reported as a
+            # malformed response, which sends you looking in the wrong place.
             raise ProviderError(
                 "Gemini hit the output token limit, so its answer is truncated. Raise "
                 "FINOPS_LLM_MAX_OUTPUT_TOKENS or lower FINOPS_GEMINI_THINKING_LEVEL."
             )
-        text = "".join(
-            part.get("text", "") for part in (candidate.get("content") or {}).get("parts", [])
-        ).strip()
-        if not text:
-            raise ProviderError(f"Gemini returned an empty response ({reason})")
-        return text
+        return candidate
 
     def _resolved_thinking_level(self) -> str | None:
         """The API enum to send, or None to leave the model's default alone.
@@ -238,6 +509,44 @@ class GeminiProvider(LlmProvider):
         if family and int(family.group(1)) < 3:
             return None
         return level
+
+
+def _gemini_text(candidate: dict) -> str:
+    """Visible prose only: thought parts carry text too, and are not the answer."""
+    return "".join(
+        part.get("text", "")
+        for part in (candidate.get("content") or {}).get("parts", [])
+        if not part.get("thought")
+    ).strip()
+
+
+def _gemini_content(message: ChatMessage) -> dict:
+    if message.role == "tool":
+        # Contents only take the user and model roles, so results ride back as user parts.
+        return {
+            "role": "user",
+            "parts": [
+                {
+                    "functionResponse": {
+                        "name": result.name,
+                        "response": (
+                            {"error": result.content}
+                            if result.is_error
+                            else {"output": result.content}
+                        ),
+                    }
+                }
+                for result in message.tool_results
+            ],
+        }
+
+    parts: list[dict] = []
+    if message.content:
+        parts.append({"text": message.content})
+    for call in message.tool_calls:
+        parts.append({"functionCall": {"name": call.name, "args": call.arguments}})
+        parts[-1].update(call.provider_data)
+    return {"role": "model" if message.role == "assistant" else "user", "parts": parts}
 
 
 def build_provider(settings: Settings, aws=None, *, http_client=None) -> LlmProvider:

@@ -198,6 +198,48 @@ export interface Health {
   llm_provider: string;
 }
 
+export interface ChatMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+}
+
+export interface ToolInvocation {
+  id: string;
+  name: string;
+  /** "finops" for scan lookups, otherwise the MCP server key, e.g. "aws" or "pricing". */
+  source: string;
+  arguments: Record<string, unknown>;
+  duration_ms: number;
+  is_error: boolean;
+  preview: string;
+}
+
+export interface McpServerStatus {
+  key: string;
+  description: string;
+  connected: boolean;
+  tool_count: number;
+  error: string | null;
+}
+
+export interface ChatReply {
+  message: string;
+  provider: string;
+  model: string;
+  tool_calls: ToolInvocation[];
+  servers: McpServerStatus[];
+  truncated: boolean;
+  error: string | null;
+}
+
+export interface ChatCapabilities {
+  provider: string;
+  supports_tools: boolean;
+  mcp_enabled: boolean;
+  servers: { key: string; description: string; enabled: boolean }[];
+  scan_tools: { name: string; description: string }[];
+}
+
 export interface Comparison {
   scan_id: string;
   baseline_scan_id: string | null;

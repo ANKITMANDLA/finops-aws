@@ -19,6 +19,7 @@ from finops.agent.provider import (
     ProviderUnavailable,
     build_provider,
 )
+from finops.agent.types import ChatMessage, ToolCall, ToolResult, ToolSpec
 from finops.config import Settings
 from finops.model import CapabilityNote, TcoReport
 
@@ -257,6 +258,237 @@ def test_gemini_truncation_names_the_token_limit(parts):
 
     with pytest.raises(ProviderError, match="FINOPS_LLM_MAX_OUTPUT_TOKENS"):
         provider.complete("sys", "user")
+
+
+# --- tool calling -------------------------------------------------------------------
+
+TOOL = ToolSpec(
+    name="aws___search_documentation",
+    description="Search AWS docs",
+    input_schema={"type": "object", "properties": {"q": {"type": "string"}}},
+)
+ASKED = [ChatMessage(role="user", content="what does EKS cost?")]
+ANSWERED = [
+    ChatMessage(
+        role="assistant",
+        content="looking that up",
+        tool_calls=[ToolCall(id="call-1", name=TOOL.name, arguments={"q": "eks"})],
+    ),
+    ChatMessage(
+        role="tool",
+        tool_results=[ToolResult(call_id="call-1", name=TOOL.name, content="$0.10 per hour")],
+    ),
+]
+
+
+def test_gemini_declares_tools_and_reads_function_calls_back():
+    http = FakeHttp(
+        body={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "let me check", "thought": False},
+                            {
+                                "functionCall": {"name": TOOL.name, "args": {"q": "eks"}},
+                                "thoughtSignature": "sig-1",
+                            },
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    provider = GeminiProvider(
+        "key", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+
+    turn = provider.converse("sys", ASKED, [TOOL])
+
+    declared = http.requests[0]["json"]["tools"][0]["functionDeclarations"][0]
+    assert declared["name"] == TOOL.name
+    assert declared["parametersJsonSchema"] == TOOL.input_schema
+    # JSON mode and function calling are mutually exclusive on this API.
+    assert "responseMimeType" not in http.requests[0]["json"]["generationConfig"]
+    assert turn.text == "let me check"
+    assert turn.tool_calls[0].arguments == {"q": "eks"}
+    assert turn.tool_calls[0].provider_data == {"thoughtSignature": "sig-1"}
+
+
+def test_gemini_replays_the_thought_signature_with_the_call():
+    """Gemini 3 fails a follow-up whose function call lost its signature."""
+    http = FakeHttp(body={"candidates": [{"content": {"parts": [{"text": "$73/mo"}]}}]})
+    provider = GeminiProvider(
+        "key", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+    history = [
+        ASKED[0],
+        ChatMessage(
+            role="assistant",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name=TOOL.name,
+                    arguments={"q": "eks"},
+                    provider_data={"thoughtSignature": "sig-1"},
+                )
+            ],
+        ),
+        ANSWERED[1],
+    ]
+
+    provider.converse("sys", history, [TOOL])
+
+    contents = http.requests[0]["json"]["contents"]
+    assert contents[1]["role"] == "model"
+    assert contents[1]["parts"][0]["thoughtSignature"] == "sig-1"
+    # Results come back as a user turn, since contents has no tool role.
+    assert contents[2]["parts"][0]["functionResponse"]["response"] == {"output": "$0.10 per hour"}
+
+
+def test_gemini_ignores_thought_text_when_reading_the_answer():
+    http = FakeHttp(
+        body={
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {"text": "the user wants pricing...", "thought": True},
+                            {"text": "It is $0.10 per hour."},
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    provider = GeminiProvider(
+        "key", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+
+    assert provider.converse("sys", ASKED).text == "It is $0.10 per hour."
+
+
+def test_openai_sends_tool_results_as_their_own_messages():
+    http = FakeHttp(
+        body={
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-9",
+                                "function": {"name": TOOL.name, "arguments": '{"q": "eks"}'},
+                            }
+                        ],
+                    }
+                }
+            ]
+        }
+    )
+    provider = OpenAiProvider("sk", "gpt-x", base_url="https://api.local/v1", http_client=http)
+
+    turn = provider.converse("sys", ANSWERED, [TOOL])
+
+    sent = http.requests[0]["json"]["messages"]
+    assert sent[0]["role"] == "system"
+    assert sent[1]["tool_calls"][0]["function"]["arguments"] == '{"q": "eks"}'
+    assert sent[2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "$0.10 per hour",
+    }
+    assert http.requests[0]["json"]["tools"][0]["function"]["parameters"] == TOOL.input_schema
+    # Arguments arrive as a JSON string and must be parsed for the caller.
+    assert turn.tool_calls[0].arguments == {"q": "eks"}
+
+
+def test_openai_survives_unparseable_tool_arguments():
+    http = FakeHttp(
+        body={
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {"id": "c", "function": {"name": TOOL.name, "arguments": "{oops"}}
+                        ]
+                    }
+                }
+            ]
+        }
+    )
+    provider = OpenAiProvider("sk", "gpt-x", base_url="https://api.local/v1", http_client=http)
+
+    assert provider.converse("sys", ASKED, [TOOL]).tool_calls[0].arguments == {}
+
+
+def test_anthropic_uses_tool_use_and_tool_result_blocks():
+    http = FakeHttp(
+        body={
+            "content": [
+                {"type": "text", "text": "checking"},
+                {"type": "tool_use", "id": "tu-1", "name": TOOL.name, "input": {"q": "eks"}},
+            ]
+        }
+    )
+    provider = AnthropicProvider("sk", "claude-x", http_client=http)
+
+    turn = provider.converse("sys", ANSWERED, [TOOL])
+
+    sent = http.requests[0]["json"]
+    assert sent["tools"][0]["input_schema"] == TOOL.input_schema
+    assert sent["messages"][0]["content"][1]["type"] == "tool_use"
+    assert sent["messages"][1]["content"][0] == {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "content": "$0.10 per hour",
+        "is_error": False,
+    }
+    assert turn.text == "checking"
+    assert turn.tool_calls[0].id == "tu-1"
+
+
+def test_bedrock_uses_tool_config_and_tool_result_status():
+    class FakeBedrock:
+        def __init__(self):
+            self.request = None
+
+        def converse(self, **kwargs):
+            self.request = kwargs
+            return {
+                "output": {
+                    "message": {
+                        "content": [
+                            {"text": "checking"},
+                            {"toolUse": {"toolUseId": "t1", "name": TOOL.name, "input": {}}},
+                        ]
+                    }
+                }
+            }
+
+    client = FakeBedrock()
+    failed = [
+        ANSWERED[0],
+        ChatMessage(
+            role="tool",
+            tool_results=[
+                ToolResult(call_id="call-1", name=TOOL.name, content="denied", is_error=True)
+            ],
+        ),
+    ]
+
+    turn = BedrockProvider(client, "model-x").converse("sys", failed, [TOOL])
+
+    spec = client.request["toolConfig"]["tools"][0]["toolSpec"]
+    assert spec["inputSchema"] == {"json": TOOL.input_schema}
+    assert client.request["messages"][1]["content"][0]["toolResult"]["status"] == "error"
+    assert turn.tool_calls[0].name == TOOL.name
+
+
+def test_a_provider_without_tool_support_says_so():
+    assert NullProvider().supports_tools is False
+    with pytest.raises(ProviderUnavailable, match="does not support conversations"):
+        NullProvider().converse("sys", ASKED, [TOOL])
 
 
 def test_http_errors_surface_as_provider_errors():

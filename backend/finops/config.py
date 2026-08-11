@@ -24,6 +24,54 @@ LlmProvider = Literal["bedrock", "anthropic", "openai", "gemini", "none"]
 GeminiThinkingLevel = Literal["minimal", "low", "medium", "high", "default"]
 
 
+class McpServer(BaseModel):
+    """One MCP server the chat assistant may call tools on.
+
+    Two transports cover everything we need: ``http`` for hosted servers such as AWS's
+    own Knowledge server, and ``stdio`` for the awslabs servers you run locally.
+    """
+
+    key: str = Field(description="Short prefix for this server's tools, e.g. 'aws'.")
+    transport: Literal["http", "stdio"] = "http"
+    url: str | None = Field(None, description="Endpoint for the http transport.")
+    command: str | None = Field(None, description="Executable for the stdio transport.")
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    enabled: bool = True
+    description: str = ""
+
+    def validate_transport(self) -> str | None:
+        """Return why this server cannot be used, or None when it is usable."""
+        if self.transport == "http" and not self.url:
+            return f"MCP server '{self.key}' uses http transport but has no url"
+        if self.transport == "stdio" and not self.command:
+            return f"MCP server '{self.key}' uses stdio transport but has no command"
+        return None
+
+
+DEFAULT_MCP_SERVERS: list[McpServer] = [
+    McpServer(
+        key="aws",
+        transport="http",
+        url="https://knowledge-mcp.global.api.aws",
+        description=(
+            "AWS Knowledge: official documentation, API references, Well-Architected "
+            "guidance, and regional availability. Hosted by AWS, no credentials needed."
+        ),
+    ),
+    McpServer(
+        key="pricing",
+        transport="stdio",
+        command="uvx",
+        args=["awslabs.aws-pricing-mcp-server@latest"],
+        description=(
+            "AWS Pricing: list prices, service attributes, and cost reports for "
+            "what-if comparisons. Runs locally and uses your AWS credentials."
+        ),
+    ),
+]
+
+
 class Thresholds(BaseModel):
     """Tunable limits that decide when a resource is considered wasteful.
 
@@ -130,6 +178,20 @@ class Settings(BaseSettings):
             "budget, so 'default' can truncate the answer. Ignored by older models."
         ),
     )
+
+    # --- Chat assistant ---
+    chat_max_tool_calls: int = Field(
+        12, ge=0, le=50, description="Tool calls allowed per question before answering anyway."
+    )
+    chat_history_messages: int = Field(
+        20, ge=2, le=200, description="How much of the conversation is replayed to the model."
+    )
+    mcp_enabled: bool = True
+    mcp_servers: list[McpServer] = Field(default_factory=lambda: list(DEFAULT_MCP_SERVERS))
+    mcp_startup_timeout_seconds: float = Field(
+        30.0, description="A server that will not connect in this long is skipped for the turn."
+    )
+    mcp_tool_timeout_seconds: float = Field(60.0, description="Per tool call.")
 
     thresholds: Thresholds = Field(default_factory=Thresholds)
 

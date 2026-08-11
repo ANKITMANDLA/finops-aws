@@ -100,10 +100,44 @@ cd frontend && npm run dev   # terminal 2, http://localhost:5173
 - **Inventory** — filterable resource explorer; click any row for the full drill-in.
 - **Architecture** — the LLM's structural recommendations, each expandable to its
   rationale, steps, trade-offs, and the findings that justify it.
+- **Assistant** — ask questions about the account in plain language. See below.
 - **Trends** — scan-over-scan movement, so you can see whether waste is going up or down.
 
 Starting a scan from the dashboard runs it in the background: the UI keeps serving the
 previous scan while the new one collects.
+
+## The assistant
+
+The Assistant tab is a chat that can look things up rather than recall them. It is given
+two sets of tools:
+
+- **Your scan** (`finops_*`) — the cost breakdown, findings with their evidence and
+  remediation, and the inventory with CloudWatch metrics and tags. This is what lets it
+  answer with a cluster name and a real number instead of general advice.
+- **AWS, over MCP** — the [AWS Knowledge MCP server](https://awslabs.github.io/mcp/servers/aws-knowledge-mcp-server)
+  for documentation, Well-Architected guidance, and regional availability, and the
+  [awslabs pricing server](https://awslabs.github.io/mcp/servers/aws-pricing-mcp-server)
+  for list prices and cost comparisons.
+
+So "my EKS clusters look idle, what do they cost and what does AWS charge for a control
+plane?" becomes a query against your scan followed by a documentation lookup, and the
+answer cites both. Every turn shows which sources it checked; expand the trace to see the
+exact calls.
+
+Both servers are read-only, and so are the scan tools, so a question can never change
+anything in your account. The Knowledge server is hosted by AWS, needs no credentials, and
+is free. The pricing server runs locally under `uvx` (install [uv](https://docs.astral.sh/uv/)
+to enable it) and uses the same AWS profile as a scan, so it needs `pricing:GetProducts`,
+`pricing:DescribeServices`, and `pricing:GetAttributeValues` — all in the bundled policy.
+Anything that will not start is reported as an unavailable source and the conversation
+continues without it.
+
+Configure the servers with `FINOPS_MCP_SERVERS` (JSON), turn the whole thing off with
+`FINOPS_MCP_ENABLED=false`, and cap how much work one question may do with
+`FINOPS_CHAT_MAX_TOOL_CALLS`. Conversations live in the browser tab and are not stored.
+
+Tool use needs a provider that supports it: Bedrock, Anthropic, OpenAI, or Gemini. Child
+process output from stdio servers goes to `mcp.log` beside the database.
 
 ## Where the numbers come from
 
@@ -172,12 +206,12 @@ FINOPS_THRESHOLDS__MIN_MONTHLY_SAVINGS_USD=5
 | `anthropic` | `FINOPS_ANTHROPIC_API_KEY` | Messages API |
 | `openai` | `FINOPS_OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `FINOPS_OPENAI_BASE_URL` |
 | `gemini` | `FINOPS_GEMINI_API_KEY` | AI Studio key; defaults to `gemini-3.6-flash`, override with `FINOPS_GEMINI_MODEL` |
+| `none` | — | Deterministic summary assembled from the findings, and no assistant |
 
 On Gemini 3 and later, thought tokens are billed against the output budget, so unbounded
 reasoning truncates the advice mid-JSON. Thinking is capped at `low` by default; raise it
 with `FINOPS_GEMINI_THINKING_LEVEL` (and `FINOPS_LLM_MAX_OUTPUT_TOKENS` alongside it) if
 you want deeper analysis.
-| `none` | — | Deterministic summary assembled from the findings |
 
 If the model is unreachable, misconfigured, or returns something unparseable, the agent
 falls back to a deterministic summary built from the findings and records why. A scan
@@ -198,7 +232,8 @@ backend/finops/
   rules/            idle, rightsizing, storage, network, containers, database,
                     commitments, governance
   tco.py            the report: totals, breakdowns, ranking
-  agent/            provider (Bedrock | Anthropic | OpenAI), prompts, advisor
+  agent/            providers (Bedrock | Anthropic | OpenAI | Gemini) with tool calling,
+                    prompts, advisor, chat agent, MCP hub, scan lookup tools
   pipeline.py       one scan, end to end
   store.py          SQLite scan history
   api.py            FastAPI routes

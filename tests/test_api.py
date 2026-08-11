@@ -215,6 +215,39 @@ def test_advice_can_be_regenerated_without_rescanning(client, store, settings):
     assert store.get_advice("20260801T120000Z-aaaa") is not None
 
 
+def test_chat_capabilities_describe_the_tools_without_connecting(client):
+    body = client.get("/api/chat/capabilities").json()
+
+    assert body["provider"] == "none"
+    assert {server["key"] for server in body["servers"]} == {"aws", "pricing"}
+    assert any(tool["name"] == "finops_search_findings" for tool in body["scan_tools"])
+
+
+def test_chat_without_a_provider_answers_with_an_error_not_a_500(client, store):
+    seeded_scan(store)
+
+    response = client.post(
+        "/api/scans/latest/chat", json={"messages": [{"role": "user", "content": "hello"}]}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == ""
+    assert "FINOPS_LLM_PROVIDER" in body["error"]
+
+
+def test_chat_needs_a_scan_to_talk_about(client):
+    response = client.post(
+        "/api/scans/latest/chat", json={"messages": [{"role": "user", "content": "hello"}]}
+    )
+    assert response.status_code == 404
+
+
+def test_chat_rejects_an_empty_conversation(client, store):
+    seeded_scan(store)
+    assert client.post("/api/scans/latest/chat", json={"messages": []}).status_code == 422
+
+
 def test_starting_a_scan_returns_immediately_with_a_job_handle(client):
     response = client.post("/api/scans", json={"regions": ["us-east-1"], "with_advice": False})
     assert response.status_code == 202

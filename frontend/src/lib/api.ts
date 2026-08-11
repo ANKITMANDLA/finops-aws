@@ -1,5 +1,8 @@
 import type {
   Advice,
+  ChatCapabilities,
+  ChatMessage,
+  ChatReply,
   Comparison,
   FilterOptions,
   Finding,
@@ -92,6 +95,13 @@ export const api = {
   advice: (scanId: string) => request<Advice>(`/scans/${scanId}/advice`),
   generateAdvice: (scanId: string) =>
     request<Advice>(`/scans/${scanId}/advice`, { method: "POST" }),
+
+  chatCapabilities: () => request<ChatCapabilities>("/chat/capabilities"),
+  chat: (scanId: string, messages: ChatMessage[]) =>
+    request<ChatReply>(`/scans/${scanId}/chat`, {
+      method: "POST",
+      body: JSON.stringify({ messages }),
+    }),
 
   trends: (limit = 30) => request<ScanMeta[]>(`/trends${query({ limit })}`),
   compare: (scanId: string, against = "previous") =>

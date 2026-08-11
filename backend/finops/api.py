@@ -20,6 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from finops import __version__
+from finops.agent.chat import ChatReply, build_chat_agent
+from finops.agent.mcp_hub import McpHub
+from finops.agent.scan_tools import TOOLS as SCAN_TOOL_SPECS
+from finops.agent.types import ChatMessage
 from finops.aws.session import AwsContext
 from finops.config import Settings, get_settings
 from finops.jobs import ScanAlreadyRunning, ScanRunner
@@ -329,6 +333,51 @@ def create_advice(
     updated = regenerate_advice(scan, settings, store=store)
     assert updated.advice is not None
     return updated.advice
+
+
+# ------------------------------------------------------------------------- chat
+
+
+class ChatRequest(BaseModel):
+    """A conversation to continue. History lives in the client, not the database."""
+
+    messages: list[ChatMessage] = Field(min_length=1)
+
+
+@router.get("/chat/capabilities")
+def chat_capabilities(settings: Settings = Depends(app_settings)) -> dict[str, Any]:
+    """What the assistant can reach, without paying to connect and find out."""
+    return {
+        "provider": settings.llm_provider,
+        "supports_tools": settings.llm_provider != "none",
+        "mcp_enabled": settings.mcp_enabled,
+        "servers": [
+            {"key": server.key, "description": server.description, "enabled": server.enabled}
+            for server in settings.mcp_servers
+        ],
+        "scan_tools": [
+            {"name": tool.name, "description": tool.description} for tool in SCAN_TOOL_SPECS
+        ],
+    }
+
+
+@router.post("/scans/{scan_id}/chat", response_model=ChatReply)
+async def chat(
+    scan_id: str,
+    request: ChatRequest,
+    store: ScanStore = Depends(get_store),
+    settings: Settings = Depends(app_settings),
+) -> ChatReply:
+    """Answer a question about this scan, calling AWS and scan tools as needed."""
+    resolved = resolve(store, scan_id)
+    agent = build_chat_agent(settings, store, resolved, AwsContext(settings=settings))
+
+    if not settings.mcp_enabled:
+        return await agent.reply(request.messages)
+    # A hub lives for one question: sessions that idle between turns are more trouble
+    # than reconnecting, and a server that is down must not break the conversation.
+    async with McpHub.from_settings(settings) as hub:
+        return await agent.reply(request.messages, hub)
 
 
 # ------------------------------------------------------------------------- trends

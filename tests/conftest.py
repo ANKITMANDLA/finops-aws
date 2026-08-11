@@ -31,6 +31,12 @@ def aws_credentials(monkeypatch):
 
 
 @pytest.fixture
+def anyio_backend() -> str:
+    """The chat agent and MCP hub are async; asyncio is the only backend we ship on."""
+    return "asyncio"
+
+
+@pytest.fixture
 def settings(tmp_path) -> Settings:
     return Settings(
         regions=[TEST_REGION],
