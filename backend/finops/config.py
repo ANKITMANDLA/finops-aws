@@ -20,7 +20,8 @@ except ImportError:  # pragma: no cover - older pydantic-settings
 
 _RegionList = Annotated[list[str], NoDecode] if NoDecode is not None else list[str]
 
-LlmProvider = Literal["bedrock", "anthropic", "openai", "none"]
+LlmProvider = Literal["bedrock", "anthropic", "openai", "gemini", "none"]
+GeminiThinkingLevel = Literal["minimal", "low", "medium", "high", "default"]
 
 
 class Thresholds(BaseModel):
@@ -104,7 +105,9 @@ class Settings(BaseSettings):
 
     # --- LLM advisor ---
     llm_provider: LlmProvider = "bedrock"
-    llm_max_output_tokens: int = 4096
+    # Six recommendations with steps and rationale is a long JSON document, and reasoning
+    # models spend part of this budget thinking before they write any of it.
+    llm_max_output_tokens: int = 8192
     llm_temperature: float = 0.2
 
     bedrock_model_id: str = "us.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -116,6 +119,17 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_model: str = "gpt-4o"
     openai_base_url: str = "https://api.openai.com/v1"
+
+    gemini_api_key: str | None = None
+    gemini_model: str = "gemini-3.6-flash"
+    gemini_base_url: str = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_thinking_level: GeminiThinkingLevel = Field(
+        "low",
+        description=(
+            "Reasoning depth for Gemini 3 and later. Thought tokens count against the output "
+            "budget, so 'default' can truncate the answer. Ignored by older models."
+        ),
+    )
 
     thresholds: Thresholds = Field(default_factory=Thresholds)
 

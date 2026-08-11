@@ -11,6 +11,7 @@ from finops.agent.prompts import SYSTEM_PROMPT, build_user_prompt
 from finops.agent.provider import (
     AnthropicProvider,
     BedrockProvider,
+    GeminiProvider,
     LlmProvider,
     NullProvider,
     OpenAiProvider,
@@ -96,6 +97,9 @@ def test_provider_selection_follows_config():
     openai = build_provider(Settings(llm_provider="openai", openai_api_key="sk-y"))
     assert isinstance(openai, OpenAiProvider)
 
+    gemini = build_provider(Settings(llm_provider="gemini", gemini_api_key="key-z"))
+    assert isinstance(gemini, GeminiProvider)
+
     assert isinstance(build_provider(Settings(llm_provider="none")), NullProvider)
 
 
@@ -103,6 +107,7 @@ def test_missing_credentials_disable_the_advisor_instead_of_crashing():
     # A forgotten API key should degrade to deterministic advice, not kill the scan.
     assert isinstance(build_provider(Settings(llm_provider="anthropic")), NullProvider)
     assert isinstance(build_provider(Settings(llm_provider="openai")), NullProvider)
+    assert isinstance(build_provider(Settings(llm_provider="gemini")), NullProvider)
     assert isinstance(build_provider(Settings(llm_provider="bedrock"), None), NullProvider)
 
 
@@ -179,6 +184,79 @@ def test_openai_posts_to_the_configured_base_url():
     assert provider.complete("sys", "user") == "hello"
     assert http.requests[0]["url"] == "https://proxy.local/v1/chat/completions"
     assert http.requests[0]["json"]["messages"][0]["role"] == "system"
+
+
+def test_gemini_sends_the_api_key_header_and_joins_parts():
+    http = FakeHttp(
+        body={"candidates": [{"content": {"parts": [{"text": "hel"}, {"text": "lo"}]}}]}
+    )
+    provider = GeminiProvider(
+        "key-test", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+
+    assert provider.complete("sys", "user") == "hello"
+    request = http.requests[0]
+    assert request["url"] == "https://gl.local/v1beta/models/gemini-x:generateContent"
+    assert request["headers"]["x-goog-api-key"] == "key-test"
+    assert request["json"]["systemInstruction"]["parts"][0]["text"] == "sys"
+    assert request["json"]["contents"][0]["parts"][0]["text"] == "user"
+
+
+def test_gemini_caps_thinking_on_models_that_support_it():
+    """Thought tokens come out of the output budget, so an uncapped model truncates."""
+    http = FakeHttp(body={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+    provider = GeminiProvider(
+        "key", "gemini-3.6-flash", base_url="https://gl.local/v1beta", http_client=http
+    )
+    provider.complete("sys", "user")
+
+    thinking = http.requests[0]["json"]["generationConfig"]["thinkingConfig"]
+    assert thinking == {"thinkingLevel": "LOW"}
+
+
+def test_gemini_omits_thinking_config_for_models_that_reject_it():
+    # Gemini 2.x answers a thinkingLevel with a 400, so it must not be sent.
+    http = FakeHttp(body={"candidates": [{"content": {"parts": [{"text": "ok"}]}}]})
+    provider = GeminiProvider(
+        "key", "gemini-2.5-pro", base_url="https://gl.local/v1beta", http_client=http
+    )
+    provider.complete("sys", "user")
+
+    assert "thinkingConfig" not in http.requests[0]["json"]["generationConfig"]
+
+    default = GeminiProvider(
+        "key",
+        "gemini-3.6-flash",
+        base_url="https://gl.local/v1beta",
+        thinking_level="default",
+        http_client=http,
+    )
+    default.complete("sys", "user")
+    assert "thinkingConfig" not in http.requests[1]["json"]["generationConfig"]
+
+
+def test_gemini_reports_a_blocked_prompt_rather_than_returning_nothing():
+    http = FakeHttp(body={"promptFeedback": {"blockReason": "SAFETY"}, "candidates": []})
+    provider = GeminiProvider(
+        "key", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+
+    with pytest.raises(ProviderError, match="SAFETY"):
+        provider.complete("sys", "user")
+
+
+@pytest.mark.parametrize("parts", [[], [{"text": '{"executive_summary": "half a doc'}]])
+def test_gemini_truncation_names_the_token_limit(parts):
+    """Truncated JSON must not reach the parser, which would blame the model's formatting."""
+    http = FakeHttp(
+        body={"candidates": [{"content": {"parts": parts}, "finishReason": "MAX_TOKENS"}]}
+    )
+    provider = GeminiProvider(
+        "key", "gemini-x", base_url="https://gl.local/v1beta", http_client=http
+    )
+
+    with pytest.raises(ProviderError, match="FINOPS_LLM_MAX_OUTPUT_TOKENS"):
+        provider.complete("sys", "user")
 
 
 def test_http_errors_surface_as_provider_errors():

@@ -2,14 +2,15 @@
 
 The advisor only needs one operation - send a system prompt plus a user prompt, get
 text back - so the interface is deliberately tiny. Bedrock is the default because it
-reuses the same AWS credentials the rest of the agent already has; Anthropic and OpenAI
-are drop-in alternatives selected with ``FINOPS_LLM_PROVIDER``.
+reuses the same AWS credentials the rest of the agent already has; Anthropic, OpenAI,
+and Gemini are drop-in alternatives selected with ``FINOPS_LLM_PROVIDER``.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from abc import ABC, abstractmethod
 
 from finops.config import Settings
@@ -56,7 +57,8 @@ class NullProvider(LlmProvider):
 
     def complete(self, system: str, user: str) -> str:
         raise ProviderUnavailable(
-            "No LLM provider configured. Set FINOPS_LLM_PROVIDER to bedrock, anthropic, or openai."
+            "No LLM provider configured. Set FINOPS_LLM_PROVIDER to bedrock, anthropic, "
+            "openai, or gemini."
         )
 
 
@@ -152,6 +154,92 @@ class OpenAiProvider(LlmProvider):
         return (choices[0].get("message", {}).get("content") or "").strip()
 
 
+class GeminiProvider(LlmProvider):
+    """Google's Gemini API (``generateContent`` on generativelanguage.googleapis.com).
+
+    Authenticated with an API key from AI Studio rather than gcloud credentials, which
+    keeps it usable from a laptop with no Google Cloud project wired up.
+    """
+
+    name = "gemini"
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        *,
+        base_url: str,
+        thinking_level: str = "low",
+        http_client=None,
+        **kwargs,
+    ) -> None:
+        super().__init__(model, **kwargs)
+        self._api_key = api_key
+        self._base_url = base_url.rstrip("/")
+        self._thinking_level = thinking_level
+        self._http = http_client
+
+    def complete(self, system: str, user: str) -> str:
+        config = {
+            "temperature": self.temperature,
+            "maxOutputTokens": self.max_tokens,
+            # The advisor asks for JSON, and saying so here stops Gemini wrapping the
+            # object in prose or a markdown fence.
+            "responseMimeType": "application/json",
+        }
+        level = self._resolved_thinking_level()
+        if level:
+            # Thought tokens are billed against maxOutputTokens, and an unbounded reasoning
+            # budget on a long inventory truncates the JSON before it closes. The advisor's
+            # input is already ranked and summarized, so it needs very little deliberation.
+            config["thinkingConfig"] = {"thinkingLevel": level}
+
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "generationConfig": config,
+        }
+        headers = {"x-goog-api-key": self._api_key, "content-type": "application/json"}
+        url = f"{self._base_url}/models/{self.model}:generateContent"
+        data = _post_json(self._http, url, payload, headers)
+
+        blocked = (data.get("promptFeedback") or {}).get("blockReason")
+        if blocked:
+            raise ProviderError(f"Gemini blocked the prompt ({blocked})")
+
+        candidates = data.get("candidates") or []
+        if not candidates:
+            raise ProviderError("Gemini returned no candidates")
+        candidate = candidates[0]
+        reason = candidate.get("finishReason") or "unknown"
+        if reason == "MAX_TOKENS":
+            # Truncated JSON would otherwise reach the parser and be reported as a malformed
+            # response, which sends you looking in the wrong place.
+            raise ProviderError(
+                "Gemini hit the output token limit, so its answer is truncated. Raise "
+                "FINOPS_LLM_MAX_OUTPUT_TOKENS or lower FINOPS_GEMINI_THINKING_LEVEL."
+            )
+        text = "".join(
+            part.get("text", "") for part in (candidate.get("content") or {}).get("parts", [])
+        ).strip()
+        if not text:
+            raise ProviderError(f"Gemini returned an empty response ({reason})")
+        return text
+
+    def _resolved_thinking_level(self) -> str | None:
+        """The API enum to send, or None to leave the model's default alone.
+
+        Thinking levels arrived with Gemini 3; sending one to an older model is a 400.
+        """
+        level = (self._thinking_level or "").strip().upper()
+        if not level or level == "DEFAULT":
+            return None
+        family = re.match(r"gemini-(\d+)", self.model)
+        if family and int(family.group(1)) < 3:
+            return None
+        return level
+
+
 def build_provider(settings: Settings, aws=None, *, http_client=None) -> LlmProvider:
     """Instantiate the configured provider, falling back to ``NullProvider``.
 
@@ -190,6 +278,19 @@ def build_provider(settings: Settings, aws=None, *, http_client=None) -> LlmProv
             settings.openai_api_key,
             settings.openai_model,
             base_url=settings.openai_base_url,
+            http_client=http_client,
+            **kwargs,
+        )
+
+    if choice == "gemini":
+        if not settings.gemini_api_key:
+            logger.warning("FINOPS_GEMINI_API_KEY is not set; advice is disabled.")
+            return NullProvider()
+        return GeminiProvider(
+            settings.gemini_api_key,
+            settings.gemini_model,
+            base_url=settings.gemini_base_url,
+            thinking_level=settings.gemini_thinking_level,
             http_client=http_client,
             **kwargs,
         )

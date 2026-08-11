@@ -171,6 +171,12 @@ FINOPS_THRESHOLDS__MIN_MONTHLY_SAVINGS_USD=5
 | `bedrock` (default) | `bedrock:InvokeModel` and model access | Reuses your AWS credentials |
 | `anthropic` | `FINOPS_ANTHROPIC_API_KEY` | Messages API |
 | `openai` | `FINOPS_OPENAI_API_KEY` | Any OpenAI-compatible endpoint via `FINOPS_OPENAI_BASE_URL` |
+| `gemini` | `FINOPS_GEMINI_API_KEY` | AI Studio key; defaults to `gemini-3.6-flash`, override with `FINOPS_GEMINI_MODEL` |
+
+On Gemini 3 and later, thought tokens are billed against the output budget, so unbounded
+reasoning truncates the advice mid-JSON. Thinking is capped at `low` by default; raise it
+with `FINOPS_GEMINI_THINKING_LEVEL` (and `FINOPS_LLM_MAX_OUTPUT_TOKENS` alongside it) if
+you want deeper analysis.
 | `none` | — | Deterministic summary assembled from the findings |
 
 If the model is unreachable, misconfigured, or returns something unparseable, the agent

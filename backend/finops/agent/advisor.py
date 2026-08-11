@@ -219,8 +219,8 @@ def _fallback_advice(
         caveats.append(f"LLM advisor error: {reason}")
     else:
         caveats.append(
-            "Set FINOPS_LLM_PROVIDER (bedrock, anthropic, or openai) to enable architectural "
-            "recommendations."
+            "Set FINOPS_LLM_PROVIDER (bedrock, anthropic, openai, or gemini) to enable "
+            "architectural recommendations."
         )
 
     return Advice(

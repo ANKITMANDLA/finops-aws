@@ -58,7 +58,7 @@ export default function Architecture() {
           title="No architectural advice yet"
           description={
             health?.llm_provider === "none"
-              ? "No LLM provider is configured. Set FINOPS_LLM_PROVIDER to bedrock, anthropic, or openai in .env, or generate a deterministic summary from the findings."
+              ? "No LLM provider is configured. Set FINOPS_LLM_PROVIDER to bedrock, anthropic, openai, or gemini in .env, or generate a deterministic summary from the findings."
               : `Ask ${health?.llm_provider} to review this scan and propose structural changes. It only sees aggregates and the ranked findings, never raw inventory.`
           }
           action={generateButton}

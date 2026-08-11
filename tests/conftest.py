@@ -22,10 +22,12 @@ def aws_credentials(monkeypatch):
         "AWS_DEFAULT_REGION": TEST_REGION,
     }.items():
         monkeypatch.setenv(key, value)
-    # Ignore any FINOPS_* settings the developer has exported locally.
+    # Ignore any FINOPS_* settings the developer has exported locally, and the .env file
+    # too: a real API key sitting there must not decide whether an assertion holds.
     for key in list(os.environ):
         if key.startswith("FINOPS_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
 
 @pytest.fixture
