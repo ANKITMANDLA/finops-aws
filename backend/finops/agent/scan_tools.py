@@ -166,6 +166,13 @@ class ScanTools:
             "identified_monthly_savings": report.identified_monthly_savings,
             "savings_percent": report.savings_percent,
             "forecast_next_month": report.forecast_next_month,
+            # Built from AWS list prices per resource, so it is populated even when Cost
+            # Explorer is unavailable. It excludes commitments, credits, and usage-priced
+            # services, so it reads higher than an invoice and is not the billed amount.
+            "list_price_monthly_cost": report.list_price_monthly_cost,
+            "list_price_optimized_monthly_cost": report.list_price_optimized_monthly_cost,
+            "priced_resources": report.priced_resource_count,
+            "unpriced_resources": report.unpriced_resource_count,
             "untagged_monthly_cost": report.untagged_monthly_cost,
             "commitment_coverage_percent": report.commitment_coverage_percent,
             **{
@@ -208,6 +215,10 @@ class ScanTools:
                     "risk": finding.risk,
                     "confidence": finding.confidence,
                     "source": finding.source,
+                    # Another change to the same resource already claims this money, so
+                    # adding it to a total would count it twice.
+                    "counted_in_total": finding.counts_toward_total,
+                    "alternative_to": finding.alternative_to,
                 }
                 for finding in findings
             ],

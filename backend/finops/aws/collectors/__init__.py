@@ -25,10 +25,13 @@ _COLLECTOR_MODULES = (
     "elbv2",
     "eks",
     "rds",
+    "efs",
     "s3",
     "lambda_",
     "dynamodb",
     "logs",
+    "security",
+    "messaging",
 )
 
 for _module in _COLLECTOR_MODULES:

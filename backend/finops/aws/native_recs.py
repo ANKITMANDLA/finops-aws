@@ -526,9 +526,11 @@ class NativeRecommendations:
             # Trusted Advisor's own resourceId is an opaque check-scoped hash. The real
             # AWS identifier is in the metadata columns, and only that can be matched
             # against the inventory or against another source's view of the same issue.
-            resource_id = _first_identifier(fields) or flagged.get("resourceId")
-            region = flagged.get("region")
-            arn = _trusted_advisor_arn(resource_id, region, self.aws.account_id)
+            identifier = _first_identifier(fields) or flagged.get("resourceId")
+            region = flagged.get("region") or _region_from_arn(identifier)
+            arn = _trusted_advisor_arn(identifier, region, self.aws.account_id)
+            # A full ARN identifies the resource but reads terribly in a title.
+            resource_id = (_arn_tail(arn) if arn else None) or identifier
             findings.append(
                 Finding(
                     id=make_finding_id(action, arn or f"ta:{check_id}:{resource_id}"),
@@ -547,11 +549,7 @@ class NativeRecommendations:
                     risk="medium",
                     cost_basis="aws_recommendation",
                     detail=check.get("description", "")[:600],
-                    evidence=[
-                        Evidence(label=str(column), value=str(value))
-                        for column, value in fields.items()
-                        if value
-                    ][:6],
+                    evidence=_trusted_advisor_evidence(fields),
                     remediation=Remediation(
                         summary="Review the flagged resource in Trusted Advisor and act on it.",
                         console_path=f"Trusted Advisor > Cost Optimization > {check_name}",
@@ -652,10 +650,23 @@ _MONEY_PATTERN = re.compile(r"\$?\s*([0-9][0-9,]*\.?[0-9]*)")
 
 
 def _extract_savings(fields: dict[str, str]) -> float:
-    """Trusted Advisor reports savings in a differently-named column per check."""
-    for column, value in fields.items():
-        if "saving" not in column.lower() or not value:
-            continue
+    """Trusted Advisor reports savings in a differently-named column per check.
+
+    Several checks report a percentage as well as an amount, and Cost Optimization Hub's put
+    "Estimated Savings Percentage" before "Estimated Monthly Savings". Reading a percentage as
+    money yields a figure that can exceed the entire cost of the resource it is attached to —
+    30% became "$30.00" on a volume renting for $17.00 a month — so the amount is looked for
+    specifically and a percentage is never mistaken for one.
+    """
+    candidates = [
+        (column, value)
+        for column, value in fields.items()
+        if value and "saving" in column.lower() and not _is_percentage(column, value)
+    ]
+    # A monthly amount beats any other amount; "Estimated Monthly Savings" over "Savings".
+    candidates.sort(key=lambda pair: "monthly" not in pair[0].lower())
+
+    for _, value in candidates:
         match = _MONEY_PATTERN.search(str(value))
         if match:
             try:
@@ -665,15 +676,42 @@ def _extract_savings(fields: dict[str, str]) -> float:
     return 0.0
 
 
+def _is_percentage(column: str, value: str) -> bool:
+    return "percent" in column.lower() or str(value).strip().endswith("%")
+
+
+# Columns that hold an id for something other than the resource. Cost Optimization Hub's
+# checks list "Recommendation Id" before "Resource Id", and reading the first id-ish column
+# picks up an opaque hash that matches nothing in the inventory.
+_NOT_THE_RESOURCE = frozenset({"recommendation", "check", "account", "request", "rule", "owner"})
+
+
 def _first_identifier(fields: dict[str, str]) -> str:
-    """Pick the column that identifies the resource, preferring ids over display names."""
+    """Pick the column that identifies the resource, preferring ids over display names.
+
+    Column headings differ from check to check, so the value's own shape is the first thing
+    trusted: an ARN or an AWS resource id is recognisable whatever it is filed under. Getting
+    this wrong is expensive rather than cosmetic — a finding that cannot name its resource
+    cannot be matched against our own view of it, and the same saving is then counted twice.
+    """
+    values = [str(value).strip() for value in fields.values() if value]
+
+    for value in values:
+        if value.startswith("arn:"):
+            return value
+    for value in values:
+        if any(pattern.match(value) for pattern, _, _ in _TA_ARN_PATHS):
+            return value
+
     for tokens in (("id", "arn"), ("name",)):
         for column, value in fields.items():
             lowered = column.lower()
             words = re.split(r"[\s_]+", lowered)
+            if _NOT_THE_RESOURCE & set(words):
+                continue
             if value and any(token in words or lowered.endswith(token) for token in tokens):
                 return str(value)
-    return next((str(v) for v in fields.values() if v), "unknown")
+    return next(iter(values), "unknown")
 
 
 # Trusted Advisor check names, keyed by a distinctive phrase, mapped onto the action the
@@ -681,9 +719,15 @@ def _first_identifier(fields: dict[str, str]) -> str:
 _TA_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("low utilization", ACTION_RIGHTSIZE, "rightsizing"),
     ("underutilized", ACTION_RIGHTSIZE, "rightsizing"),
+    ("recommendations for instances", ACTION_RIGHTSIZE, "rightsizing"),
     ("idle", ACTION_STOP, "idle"),
     ("unassociated", ACTION_RELEASE, "network"),
     ("unattached", ACTION_DELETE, "storage"),
+    # These ask for a smaller or cheaper volume, not for deleting one. Mapping them onto
+    # the same action our own EBS rules use is what stops the two being counted twice.
+    ("over-provisioned", ACTION_MODIFY_STORAGE, "storage"),
+    ("recommendations for volumes", ACTION_MODIFY_STORAGE, "storage"),
+    ("multipart upload", ACTION_MODIFY_STORAGE, "storage"),
     ("without", ACTION_DELETE, "storage"),
     ("reserved instance", ACTION_PURCHASE_COMMITMENT, "commitments"),
     ("savings plan", ACTION_PURCHASE_COMMITMENT, "commitments"),
@@ -706,6 +750,50 @@ _TA_ARN_PATHS: tuple[tuple[re.Pattern[str], str, str], ...] = (
     (re.compile(r"^vol-[0-9a-f]{8,}$"), "ec2", "volume/{id}"),
     (re.compile(r"^eipalloc-[0-9a-f]{8,}$"), "ec2", "elastic-ip/{id}"),
 )
+
+
+# Columns that say nothing a reader of the finding does not already know, or that repeat a
+# figure shown above the evidence. Cost Optimization Hub's checks lead with five of these and
+# keep what matters — the action, the sizes, the cost — until column eight.
+_TA_UNINFORMATIVE = frozenset(
+    {
+        "status",
+        "region",
+        "recommendation id",
+        "resource id",
+        "resource arn",
+        "arn",
+        "currency code",
+        "last updated time",
+        "current resource type",
+        "recommended resource type",
+    }
+)
+
+# "Day 1" through "Day 14": the fourteen daily readings behind an average reported alongside.
+_TA_DAILY_COLUMN = re.compile(r"^day \d+$")
+
+
+def _trusted_advisor_evidence(fields: dict[str, str]) -> list[Evidence]:
+    """The columns worth reading, in the order the check reports them."""
+    kept: list[Evidence] = []
+    for column, value in fields.items():
+        lowered = str(column).strip().lower()
+        if not value or lowered in _TA_UNINFORMATIVE or _TA_DAILY_COLUMN.match(lowered):
+            continue
+        # The savings figure is the headline of the finding; repeating it invites the reader
+        # to wonder which of the two is the answer.
+        if "saving" in lowered:
+            continue
+        kept.append(Evidence(label=str(column), value=str(value)))
+    return kept[:8]
+
+
+def _region_from_arn(value: str | None) -> str | None:
+    if not value or not value.startswith("arn:"):
+        return None
+    parts = value.split(":")
+    return parts[3] or None if len(parts) > 3 else None
 
 
 def _trusted_advisor_arn(

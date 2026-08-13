@@ -10,7 +10,7 @@ import hashlib
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 Confidence = Literal["high", "medium", "low"]
 Effort = Literal["low", "medium", "high"]
@@ -166,6 +166,14 @@ class Finding(BaseModel):
     evidence: list[Evidence] = Field(default_factory=list)
     remediation: Remediation | None = None
     tags: dict[str, str] = Field(default_factory=dict)
+    # Set when another finding on the same resource already claims its savings. Both are
+    # worth doing and worth showing, but only one may be counted, or the total promises
+    # money twice over. Holds the title of the finding that is counted.
+    alternative_to: str | None = None
+
+    @property
+    def counts_toward_total(self) -> bool:
+        return self.alternative_to is None
 
     @property
     def annual_savings(self) -> float:
@@ -227,8 +235,19 @@ class TcoReport(BaseModel):
     optimized_monthly_run_rate: float = 0.0
     savings_percent: float = 0.0
 
+    # Cost of ownership built up from AWS list prices for the inventory we found, rather
+    # than from the bill. This is what an account without Cost Explorer access has to work
+    # with, and it is a per-resource figure, so it can be attributed and acted on.
+    list_price_monthly_cost: float = 0.0
+    priced_resource_count: int = 0
+    unpriced_resource_count: int = 0
+
     by_service: list[BreakdownItem] = Field(default_factory=list)
     by_region: list[BreakdownItem] = Field(default_factory=list)
+    # The same two dimensions built from list prices, so an account without Cost Explorer
+    # access still gets a breakdown rather than an empty chart.
+    list_price_by_service: list[BreakdownItem] = Field(default_factory=list)
+    list_price_by_region: list[BreakdownItem] = Field(default_factory=list)
     by_usage_type: list[BreakdownItem] = Field(default_factory=list)
     by_category: list[BreakdownItem] = Field(default_factory=list)
     by_effort: list[BreakdownItem] = Field(default_factory=list)
@@ -236,6 +255,19 @@ class TcoReport(BaseModel):
 
     untagged_monthly_cost: float = 0.0
     commitment_coverage_percent: float | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def list_price_optimized_monthly_cost(self) -> float:
+        """What the same inventory would list at once the identified changes are made."""
+        return round(max(self.list_price_monthly_cost - self.identified_monthly_savings, 0.0), 2)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def list_price_savings_percent(self) -> float:
+        if self.list_price_monthly_cost <= 0:
+            return 0.0
+        return round(self.identified_monthly_savings / self.list_price_monthly_cost * 100, 2)
 
 
 class ArchitectureRecommendation(BaseModel):

@@ -72,8 +72,10 @@ def wired(monkeypatch):
             return [make_finding("compute-optimizer", savings=25.0, source="compute-optimizer")]
 
     class FakePricing:
-        def __init__(self, aws, notes=None):
-            pass
+        pass
+
+    def fake_build_pricing(aws, notes=None, cache_path=None):
+        return FakePricing()
 
     def fake_attribute(resources, snapshot, pricing):
         calls["attributed"] = True
@@ -90,7 +92,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(pipeline, "CostExplorer", FakeExplorer)
     monkeypatch.setattr(pipeline, "MetricsCollector", FakeMetrics)
     monkeypatch.setattr(pipeline, "NativeRecommendations", FakeNative)
-    monkeypatch.setattr(pipeline, "PricingClient", FakePricing)
+    monkeypatch.setattr(pipeline, "build_pricing", fake_build_pricing)
     monkeypatch.setattr(pipeline, "attribute_costs", fake_attribute)
     monkeypatch.setattr(pipeline, "run_rules", fake_run_rules)
     return calls

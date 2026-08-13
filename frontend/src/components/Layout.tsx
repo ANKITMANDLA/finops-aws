@@ -3,6 +3,7 @@ import { NavLink, Outlet } from "react-router-dom";
 import { dateTime, money, relativeTime } from "@/lib/format";
 import { useScanContext } from "@/state/ScanContext";
 
+import ChatWidget from "./ChatWidget";
 import { Badge, Button, Select, Spinner, cx } from "./ui";
 
 const NAV = [
@@ -10,7 +11,6 @@ const NAV = [
   { to: "/savings", label: "Savings" },
   { to: "/inventory", label: "Inventory" },
   { to: "/architecture", label: "Architecture" },
-  { to: "/chat", label: "Assistant" },
   { to: "/trends", label: "Trends" },
 ];
 
@@ -127,6 +127,9 @@ export default function Layout() {
           <Outlet />
         </main>
       </div>
+
+      {/* Outside <main> so a conversation is not remounted by route changes. */}
+      <ChatWidget />
     </div>
   );
 }

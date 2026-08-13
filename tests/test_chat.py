@@ -7,7 +7,7 @@ import json
 import pytest
 from tests.factories import make_finding, make_resource, make_scan
 
-from finops.agent.chat import ChatAgent, build_chat_agent
+from finops.agent.chat import ChatAgent, build_chat_agent, flatten_math
 from finops.agent.mcp_hub import McpHub, McpServerStatus
 from finops.agent.provider import LlmProvider, NullProvider, ProviderError
 from finops.agent.scan_tools import ScanTools
@@ -198,6 +198,55 @@ async def test_missing_sources_are_declared_in_the_system_prompt(scan_tools):
 
     system = provider.calls[0]["system"]
     assert "unavailable for this conversation: aws, pricing" in system
+
+
+# --- readable answers ---------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_latex_arithmetic_is_flattened_before_it_reaches_the_ui(scan_tools):
+    provider = ScriptedProvider(
+        [
+            ProviderTurn(
+                text=(
+                    "gp2 Monthly Cost:\n"
+                    "$$\\text{Cost} = S \\times $0.10$$\n\n"
+                    "gp3 Monthly Cost:\n"
+                    "$$\\text{Cost} = S \\times $0.08 + $0.00 \\text{ (extra IOPS)}$$"
+                )
+            )
+        ]
+    )
+
+    reply = await ChatAgent(provider, scan_tools).reply([ChatMessage(role="user", content="hi")])
+
+    assert "$$" not in reply.message
+    assert "\\text" not in reply.message
+    assert "Cost = S x $0.10" in reply.message
+    assert "Cost = S x $0.08 + $0.00 (extra IOPS)" in reply.message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (r"\(30 \times 0.08\) = $2.40", "30 x 0.08 = $2.40"),
+        (r"\[\frac{120}{730}\]", "120 / 730"),
+        (r"savings \approx $12 per month", "savings ~ $12 per month"),
+        ("plain prose with a $12.00 price", "plain prose with a $12.00 price"),
+        ("a table | of | prices", "a table | of | prices"),
+    ],
+)
+def test_math_flattening_leaves_ordinary_prose_alone(raw, expected):
+    assert flatten_math(raw) == expected
+
+
+def test_math_inside_a_code_span_is_left_as_written():
+    text = "Use `$$x \\times y$$` verbatim, but not $$a \\times b$$ here."
+
+    flattened = flatten_math(text)
+
+    assert "`$$x \\times y$$`" in flattened
+    assert "a x b" in flattened
 
 
 # --- grounding ----------------------------------------------------------------------

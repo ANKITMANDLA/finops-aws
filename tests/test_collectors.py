@@ -86,7 +86,92 @@ def seeded_account():
         logs = boto3.client("logs", region_name=TEST_REGION)
         logs.create_log_group(logGroupName="/aws/lambda/never-expires")
 
-        yield {"instance_id": instance_id, "volume_id": volume["VolumeId"]}
+        efs = boto3.client("efs", region_name=TEST_REGION)
+        file_system = efs.create_file_system(
+            CreationToken="shared",
+            ThroughputMode="provisioned",
+            ProvisionedThroughputInMibps=64.0,
+            Tags=[{"Key": "Name", "Value": "shared-data"}],
+        )
+        efs.put_lifecycle_configuration(
+            FileSystemId=file_system["FileSystemId"],
+            LifecyclePolicies=[
+                {"TransitionToIA": "AFTER_30_DAYS"},
+                {"TransitionToPrimaryStorageClass": "AFTER_1_ACCESS"},
+            ],
+        )
+
+        # A transit gateway with one attachment, an interface endpoint alongside a free
+        # gateway endpoint, and a VPN connection.
+        gateway = ec2.create_transit_gateway(Description="hub")["TransitGateway"]
+        attachment = ec2.create_transit_gateway_vpc_attachment(
+            TransitGatewayId=gateway["TransitGatewayId"],
+            VpcId=vpc["VpcId"],
+            SubnetIds=[subnet_a["SubnetId"]],
+        )["TransitGatewayVpcAttachment"]
+        interface_endpoint = ec2.create_vpc_endpoint(
+            VpcId=vpc["VpcId"],
+            ServiceName=f"com.amazonaws.{TEST_REGION}.secretsmanager",
+            VpcEndpointType="Interface",
+            SubnetIds=[subnet_a["SubnetId"], subnet_b["SubnetId"]],
+        )["VpcEndpoint"]
+        ec2.create_vpc_endpoint(
+            VpcId=vpc["VpcId"],
+            ServiceName=f"com.amazonaws.{TEST_REGION}.s3",
+            VpcEndpointType="Gateway",
+        )
+        customer_gateway = ec2.create_customer_gateway(
+            Type="ipsec.1", PublicIp="203.0.113.5", BgpAsn=65000
+        )["CustomerGateway"]
+        vpn_gateway = ec2.create_vpn_gateway(Type="ipsec.1")["VpnGateway"]
+        ec2.create_vpn_connection(
+            Type="ipsec.1",
+            CustomerGatewayId=customer_gateway["CustomerGatewayId"],
+            VpnGatewayId=vpn_gateway["VpnGatewayId"],
+        )
+
+        kms = boto3.client("kms", region_name=TEST_REGION)
+        customer_key = kms.create_key(Description="app data")["KeyMetadata"]
+        kms.create_alias(AliasName="alias/app-data", TargetKeyId=customer_key["KeyId"])
+
+        secrets = boto3.client("secretsmanager", region_name=TEST_REGION)
+        secrets.create_secret(Name="prod/db/password", SecretString="hunter2")
+
+        acm = boto3.client("acm", region_name=TEST_REGION)
+        certificate = acm.request_certificate(DomainName="test.example.com")
+
+        sns = boto3.client("sns", region_name=TEST_REGION)
+        topic = sns.create_topic(Name="alerts")
+
+        sqs = boto3.client("sqs", region_name=TEST_REGION)
+        sqs.create_queue(QueueName="jobs")
+
+        ecr = boto3.client("ecr", region_name=TEST_REGION)
+        ecr.create_repository(repositoryName="team/api")
+
+        cloudwatch = boto3.client("cloudwatch", region_name=TEST_REGION)
+        cloudwatch.put_metric_alarm(
+            AlarmName="cpu-high",
+            MetricName="CPUUtilization",
+            Namespace="AWS/EC2",
+            Statistic="Average",
+            Period=300,
+            EvaluationPeriods=1,
+            Threshold=80.0,
+            ComparisonOperator="GreaterThanThreshold",
+        )
+
+        yield {
+            "instance_id": instance_id,
+            "volume_id": volume["VolumeId"],
+            "file_system_id": file_system["FileSystemId"],
+            "transit_gateway_id": gateway["TransitGatewayId"],
+            "attachment_id": attachment["TransitGatewayAttachmentId"],
+            "endpoint_id": interface_endpoint["VpcEndpointId"],
+            "key_id": customer_key["KeyId"],
+            "certificate_arn": certificate["CertificateArn"],
+            "topic_arn": topic["TopicArn"],
+        }
 
 
 def test_registry_covers_the_expected_services():
@@ -104,10 +189,21 @@ def test_registry_covers_the_expected_services():
         "rds",
         "rds-cluster",
         "rds-snapshot",
+        "efs",
         "s3",
         "lambda",
         "dynamodb",
         "logs",
+        "tgw",
+        "vpce",
+        "vpn",
+        "kms",
+        "secrets",
+        "acm",
+        "sns",
+        "sqs",
+        "ecr",
+        "alarms",
     } <= set(REGISTRY)
 
 
@@ -153,10 +249,136 @@ def test_collect_inventory_discovers_seeded_resources(seeded_account, collection
     log_group = grouped["logs:log-group"][0]
     assert log_group.attributes["never_expires"] is True
 
+    file_system = grouped["efs:file-system"][0]
+    assert file_system.resource_id == seeded_account["file_system_id"]
+    assert file_system.name == "shared-data"
+    assert file_system.attributes["throughput_mode"] == "provisioned"
+    assert file_system.attributes["provisioned_throughput_mibps"] == 64.0
+    assert file_system.attributes["transition_to_ia"] == "AFTER_30_DAYS"
+    assert file_system.attributes["transition_to_primary_storage_class"] == "AFTER_1_ACCESS"
+    assert file_system.attributes["one_zone"] is False
+    assert file_system.attributes["mount_target_count"] == 0
+
     # Every resource must carry the identifying fields the rest of the pipeline needs.
     for resource in resources:
         assert resource.arn and resource.resource_id and resource.region
         assert resource.account_id == "123456789012"
+
+
+def test_transit_gateway_attachments_record_who_pays(seeded_account, collection_context):
+    resources = collect_inventory(collection_context, only=["tgw"], regions=[TEST_REGION])
+    grouped = _by_type(resources)
+
+    gateway = grouped["ec2:transit-gateway"][0]
+    assert gateway.resource_id == seeded_account["transit_gateway_id"]
+    assert gateway.attributes["owned_by_this_account"] is True
+
+    attachment = grouped["ec2:transit-gateway-attachment"][0]
+    assert attachment.resource_id == seeded_account["attachment_id"]
+    assert attachment.attributes["attachment_kind"] == "vpc"
+    assert attachment.attributes["transit_gateway_id"] == seeded_account["transit_gateway_id"]
+    assert attachment.attributes["owned_by_this_account"] is True
+
+
+def test_a_shared_transit_gateway_is_not_billed_to_this_account(
+    seeded_account, collection_context, monkeypatch
+):
+    """A gateway shared in through RAM looks local but belongs to someone else."""
+    from finops.aws.collectors.network import TransitGatewayCollector
+
+    original = collection_context.client
+
+    def patched(service: str, region: str):
+        client = original(service, region)
+        if service != "ec2":
+            return client
+        describe = client.describe_transit_gateways
+
+        def owned_elsewhere(**kwargs):
+            response = describe(**kwargs)
+            for gateway in response.get("TransitGateways", []):
+                gateway["OwnerId"] = "999988887777"
+            return response
+
+        client.describe_transit_gateways = owned_elsewhere
+        return client
+
+    monkeypatch.setattr(collection_context, "client", patched)
+    resources = TransitGatewayCollector().collect(collection_context, TEST_REGION)
+
+    gateway = next(r for r in resources if r.resource_type == "ec2:transit-gateway")
+    assert gateway.attributes["owned_by_this_account"] is False
+    assert gateway.account_id == "999988887777"
+
+
+def test_only_billable_vpc_endpoints_are_marked_as_such(seeded_account, collection_context):
+    resources = collect_inventory(collection_context, only=["vpce"], regions=[TEST_REGION])
+    interface = next(r for r in resources if r.resource_id == seeded_account["endpoint_id"])
+    gateway = next(r for r in resources if r.attributes["endpoint_type"] == "Gateway")
+
+    assert interface.attributes["billable"] is True
+    # Charged per availability zone, and it was placed in two subnets.
+    assert interface.attributes["network_interface_count"] == 2
+    assert interface.attributes["service_name"].endswith("secretsmanager")
+    assert gateway.attributes["billable"] is False
+
+
+def test_vpn_connections_report_tunnel_health(seeded_account, collection_context):
+    resources = collect_inventory(collection_context, only=["vpn"], regions=[TEST_REGION])
+    connection = next(r for r in resources if r.resource_type == "ec2:vpn-connection")
+    assert connection.attributes["customer_gateway_id"].startswith("cgw-")
+    assert connection.attributes["tunnels_up"] == connection.attributes["tunnel_status"].count("UP")
+
+
+def test_only_customer_managed_kms_keys_are_collected(seeded_account, collection_context):
+    """AWS managed keys are free, so carrying them would inflate the estate for nothing."""
+    resources = collect_inventory(collection_context, only=["kms"], regions=[TEST_REGION])
+    assert [r.resource_id for r in resources] == [seeded_account["key_id"]]
+    key = resources[0]
+    assert key.attributes["key_manager"] == "CUSTOMER"
+    assert key.name == "alias/app-data"
+
+
+def test_secrets_and_certificates_are_collected(seeded_account, collection_context):
+    resources = collect_inventory(
+        collection_context, only=["secrets", "acm"], regions=[TEST_REGION]
+    )
+    grouped = _by_type(resources)
+
+    secret = grouped["secretsmanager:secret"][0]
+    assert secret.resource_id == "prod/db/password"
+    assert secret.state == "active"
+
+    certificate = grouped["acm:certificate"][0]
+    assert certificate.arn == seeded_account["certificate_arn"]
+    assert certificate.attributes["domain_name"] == "test.example.com"
+    assert certificate.attributes["in_use"] is False
+
+
+def test_messaging_and_registry_resources_are_collected(seeded_account, collection_context):
+    resources = collect_inventory(
+        collection_context, only=["sns", "sqs", "ecr", "alarms"], regions=[TEST_REGION]
+    )
+    grouped = _by_type(resources)
+
+    topic = grouped["sns:topic"][0]
+    assert topic.arn == seeded_account["topic_arn"]
+    assert topic.attributes["subscription_count"] == 0
+
+    queue = grouped["sqs:queue"][0]
+    assert queue.resource_id == "jobs"
+    assert queue.attributes["fifo"] is False
+
+    repository = grouped["ecr:repository"][0]
+    assert repository.resource_id == "team/api"
+    assert repository.attributes["has_lifecycle_policy"] is False
+    # An empty registry is zero bytes, which is different from an unreadable one.
+    assert repository.attributes["size_gb"] == 0.0
+    assert repository.attributes["image_count"] == 0
+
+    alarm = grouped["cloudwatch:alarm"][0]
+    assert alarm.resource_id == "cpu-high"
+    assert alarm.attributes["alarm_kind"] == "standard"
 
 
 def test_collect_inventory_honours_the_only_filter(seeded_account, collection_context):

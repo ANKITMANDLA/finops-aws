@@ -51,12 +51,22 @@ export default function FindingDetail({
           <Badge tone={finding.rollback_possible ? "good" : "warn"}>
             {finding.rollback_possible ? "reversible" : "not reversible"}
           </Badge>
+          {finding.alternative_to && (
+            <Badge tone="neutral" title={`Counted under: ${finding.alternative_to}`}>
+              alternative
+            </Badge>
+          )}
         </div>
         {finding.detail && <p className="mt-2 text-sm text-ink-muted">{finding.detail}</p>}
       </div>
 
       <div className="flex items-baseline gap-2">
-        <span className="tabular text-xl font-semibold text-good">
+        <span
+          className={cx(
+            "tabular text-xl font-semibold",
+            finding.alternative_to ? "text-ink-muted" : "text-good",
+          )}
+        >
           {money(finding.estimated_monthly_savings)}/mo
         </span>
         <span className="text-xs text-ink-faint">
@@ -64,6 +74,14 @@ export default function FindingDetail({
           {COST_BASIS_LABELS[finding.cost_basis]}
         </span>
       </div>
+
+      {finding.alternative_to && (
+        <p className="rounded-lg border border-line/70 bg-canvas/50 p-3 text-xs text-ink-muted">
+          Another change to this resource already claims these savings, so this figure is
+          left out of the totals to avoid counting the same money twice. Counted instead:{" "}
+          <span className="text-ink">{finding.alternative_to}</span>.
+        </p>
+      )}
 
       {finding.evidence.length > 0 && (
         <div>

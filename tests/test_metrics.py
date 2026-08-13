@@ -167,6 +167,102 @@ def test_nat_gateway_bytes_are_converted_to_monthly_gigabytes(settings):
     assert gateway.metrics["nat_bytes_processed_per_month_gb"] == pytest.approx(30.44)
 
 
+def test_efs_byte_counts_become_average_and_peak_throughput(settings):
+    # A full day of traffic at 1 MiB/s. Read as an hour's worth, the same total is 24 MiB/s,
+    # which is what the peak query asks for.
+    a_day_at_one_mibps = float(86400 * 1024**2)
+    client = FakeCloudWatchClient(
+        {"MeteredIOBytes": [a_day_at_one_mibps], "ClientConnections": [12.0, 4.0]}
+    )
+    file_system = make_resource("fs-1", resource_type="efs:file-system", service="EFS")
+
+    collector(client, settings).collect([file_system])
+
+    assert file_system.metrics["efs_throughput_mibps_avg"] == pytest.approx(1.0)
+    assert file_system.metrics["efs_throughput_mibps_peak"] == pytest.approx(24.0)
+    assert file_system.metrics["efs_client_connections_max"] == 12.0
+    periods = {
+        query["MetricStat"]["Period"]
+        for request in client.requests
+        for query in request["MetricDataQueries"]
+        if query["MetricStat"]["Metric"]["MetricName"] == "MeteredIOBytes"
+    }
+    assert periods == {3600, 86400}
+
+
+def test_transit_gateway_traffic_is_summed_across_both_directions(settings):
+    one_gb_per_day = float(1024**3)
+    client = FakeCloudWatchClient({"BytesIn": [one_gb_per_day], "BytesOut": [one_gb_per_day]})
+    attachment = make_resource(
+        "tgw-attach-1",
+        resource_type="ec2:transit-gateway-attachment",
+        service="VPC",
+        attributes={"transit_gateway_id": "tgw-1", "attachment_kind": "vpc"},
+    )
+
+    collector(client, settings).collect([attachment])
+
+    assert attachment.metrics["tgw_bytes_per_day"] == pytest.approx(2 * one_gb_per_day)
+    assert attachment.metrics["tgw_bytes_processed_per_month_gb"] == pytest.approx(2 * 30.44)
+    dimensions = client.requests[0]["MetricDataQueries"][0]["MetricStat"]["Metric"]["Dimensions"]
+    assert {d["Name"] for d in dimensions} == {"TransitGateway", "TransitGatewayAttachment"}
+
+
+def test_an_attachment_without_its_gateway_id_is_not_queried(settings):
+    client = FakeCloudWatchClient({"BytesIn": [1.0]})
+    orphan = make_resource(
+        "tgw-attach-2", resource_type="ec2:transit-gateway-attachment", service="VPC"
+    )
+
+    collector(client, settings).collect([orphan])
+
+    assert orphan.metrics == {}
+    assert client.requests == []
+
+
+def test_free_vpc_endpoints_are_not_queried_but_billable_ones_are(settings):
+    one_gb_per_day = float(1024**3)
+    client = FakeCloudWatchClient({"BytesProcessed": [one_gb_per_day], "ActiveConnections": [4.0]})
+    interface = make_resource(
+        "vpce-1",
+        resource_type="ec2:vpc-endpoint",
+        service="VPC",
+        attributes={"billable": True, "endpoint_type": "Interface"},
+    )
+    gateway = make_resource(
+        "vpce-2",
+        resource_type="ec2:vpc-endpoint",
+        service="VPC",
+        attributes={"billable": False, "endpoint_type": "Gateway"},
+    )
+
+    collector(client, settings).collect([interface, gateway])
+
+    assert interface.metrics["endpoint_bytes_processed_per_month_gb"] == pytest.approx(30.44)
+    assert interface.metrics["endpoint_active_connections"] == 4.0
+    assert gateway.metrics == {}
+    # PrivateLink spells its dimensions with spaces.
+    dimensions = client.requests[0]["MetricDataQueries"][0]["MetricStat"]["Metric"]["Dimensions"]
+    assert {d["Name"] for d in dimensions} == {"VPC Endpoint Id", "Endpoint Type"}
+
+
+def test_queue_requests_count_empty_polls_too(settings):
+    client = FakeCloudWatchClient(
+        {
+            "NumberOfMessagesSent": [100.0],
+            "NumberOfMessagesReceived": [100.0],
+            "NumberOfMessagesDeleted": [100.0],
+            "NumberOfEmptyReceives": [700.0],
+        }
+    )
+    queue = make_resource("jobs", resource_type="sqs:queue", service="SQS")
+
+    collector(client, settings).collect([queue])
+
+    # A poll that returns nothing is still a billable request.
+    assert queue.metrics["sqs_requests_per_month"] == pytest.approx(1000 * 30.44)
+
+
 def test_queries_are_batched_to_the_api_limit(settings):
     client = FakeCloudWatchClient({"CPUUtilization": [5.0]})
     # Five specs per running instance, so 150 instances produce 750 queries.

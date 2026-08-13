@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 
 import typer
@@ -11,6 +12,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from finops.aws.errors import NoteCollector
+from finops.aws.pricing import build_pricing
 from finops.aws.session import AwsContext, CredentialsUnavailable
 from finops.config import get_settings
 from finops.model import Scan
@@ -108,6 +111,7 @@ def scan(
                 with_advice=not no_advice,
                 progress=lambda stage, message: status.update(f"[bold]{stage}[/bold]: {message}"),
             )
+        _write_scan(result, output)
         _print_report(result)
         console.print(f"\nScan id: [bold]{result.scan_id}[/bold]")
         return
@@ -137,13 +141,18 @@ def scan(
             progress=lambda stage, message: status.update(f"[bold]{stage}[/bold]: {message}"),
         )
 
-    if output:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
-        console.print(f"Wrote {output}")
+    _write_scan(result, output)
 
     _print_report(result)
     console.print(f"\nScan id: [bold]{result.scan_id}[/bold]")
+
+
+def _write_scan(result: Scan, output: Path | None) -> None:
+    if output is None:
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    console.print(f"Wrote {output}")
 
 
 @app.command()
@@ -317,6 +326,143 @@ def serve(
     )
 
 
+@app.command()
+def prices(
+    region: str = typer.Option(None, "--region", "-r", help="Defaults to the first scan region."),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Look up every list price the agent uses, to show where the numbers come from."""
+    _configure_logging(verbose)
+    settings = get_settings()
+    aws = AwsContext(settings=settings)
+    try:
+        aws.verify_credentials()
+    except CredentialsUnavailable as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    target = region or aws.default_region
+    notes = NoteCollector()
+    # A throwaway cache, so this always asks AWS rather than reciting an earlier answer.
+    with tempfile.TemporaryDirectory() as scratch:
+        pricing = build_pricing(aws, notes, cache_path=Path(scratch) / "prices.json")
+        lookups = [
+            (
+                "EC2 m5.large, Linux",
+                "hour",
+                lambda: pricing.ec2_instance_hourly(target, "m5.large"),
+            ),
+            ("EBS gp3 storage", "GB-month", lambda: pricing.ebs_gb_month(target, "gp3")),
+            ("EBS gp3 IOPS", "IOPS-month", lambda: pricing.ebs_iops_month(target, "gp3")),
+            (
+                "EBS gp3 throughput",
+                "MiBps-month",
+                lambda: pricing.ebs_throughput_month(target, "gp3"),
+            ),
+            ("EBS snapshot", "GB-month", lambda: pricing.snapshot_gb_month(target)),
+            ("NAT gateway", "hour", lambda: pricing.nat_gateway_hourly(target)),
+            ("NAT data processing", "GB", lambda: pricing.nat_gateway_gb(target)),
+            (
+                "Application Load Balancer",
+                "hour",
+                lambda: pricing.load_balancer_hourly(target, "application"),
+            ),
+            ("Public IPv4 address", "hour", lambda: pricing.public_ipv4_hourly(target)),
+            ("EKS control plane", "hour", lambda: pricing.eks_cluster_hourly(target)),
+            ("S3 Standard", "GB-month", lambda: pricing.s3_standard_gb_month(target)),
+            ("EFS Standard", "GB-month", lambda: pricing.efs_storage_gb_month(target)),
+            (
+                "EFS Infrequent Access",
+                "GB-month",
+                lambda: pricing.efs_storage_gb_month(target, "ia"),
+            ),
+            (
+                "EFS provisioned throughput",
+                "MiBps-month",
+                lambda: pricing.efs_provisioned_throughput_month(target),
+            ),
+            ("CloudWatch Logs storage", "GB-month", lambda: pricing.logs_storage_gb_month(target)),
+            (
+                "RDS db.m5.large, MySQL",
+                "hour",
+                lambda: pricing.rds_instance_hourly(target, "db.m5.large", "mysql"),
+            ),
+            ("RDS gp3 storage", "GB-month", lambda: pricing.rds_storage_gb_month(target, "gp3")),
+            ("RDS backup", "GB-month", lambda: pricing.rds_backup_gb_month(target)),
+            ("Lambda duration", "GB-second", lambda: pricing.lambda_gb_second(target)),
+            ("Lambda requests", "request", lambda: pricing.lambda_request(target)),
+            (
+                "DynamoDB read capacity",
+                "unit-hour",
+                lambda: pricing.dynamodb_capacity_hourly(target, "read"),
+            ),
+            (
+                "DynamoDB write capacity",
+                "unit-hour",
+                lambda: pricing.dynamodb_capacity_hourly(target, "write"),
+            ),
+            ("DynamoDB storage", "GB-month", lambda: pricing.dynamodb_storage_gb_month(target)),
+            (
+                "Transit gateway attachment",
+                "hour",
+                lambda: pricing.transit_gateway_attachment_hourly(target),
+            ),
+            (
+                "Transit gateway data",
+                "GB",
+                lambda: pricing.transit_gateway_gb(target),
+            ),
+            ("VPC interface endpoint", "hour", lambda: pricing.vpc_endpoint_hourly(target)),
+            ("VPC endpoint data", "GB", lambda: pricing.vpc_endpoint_gb(target)),
+            ("Site-to-Site VPN", "hour", lambda: pricing.vpn_connection_hourly(target)),
+            ("Client VPN endpoint", "hour", lambda: pricing.client_vpn_endpoint_hourly(target)),
+            ("KMS customer managed key", "month", lambda: pricing.kms_key_month(target)),
+            ("Secrets Manager secret", "month", lambda: pricing.secret_month(target)),
+            ("ACM private CA", "month", lambda: pricing.private_ca_month(target)),
+            ("ECR storage", "GB-month", lambda: pricing.ecr_storage_gb_month(target)),
+            ("CloudWatch alarm", "month", lambda: pricing.cloudwatch_alarm_month(target)),
+            ("SNS published message", "message", lambda: pricing.sns_request(target)),
+            ("SQS request", "request", lambda: pricing.sqs_request(target)),
+        ]
+
+        table = Table(title=f"On-demand list prices in {target}")
+        table.add_column("Charge")
+        table.add_column("Price", justify="right")
+        table.add_column("Per")
+        table.add_column("Source")
+        sources = {
+            "pricing-api": "pricing:GetProducts",
+            "public-price-list": "published price list",
+        }
+        resolved = 0
+        for label, unit, lookup in lookups:
+            price = lookup()
+            if price is None:
+                table.add_row(label, "[yellow]unknown[/yellow]", unit, "[yellow]-[/yellow]")
+                continue
+            resolved += 1
+            source = sources.get(price.source, price.source)
+            amount = f"{price.amount:.7f}".rstrip("0").rstrip(".")
+            table.add_row(label, f"${amount}", unit, source)
+
+    console.print(table)
+    console.print(f"Resolved {resolved} of {len(lookups)} charges from AWS.")
+    if pricing.used_public_price_list:
+        console.print(
+            "The Price List API was unavailable, so rates came from the price list files "
+            "AWS publishes. Same numbers, no credentials needed."
+        )
+    if resolved < len(lookups):
+        console.print(
+            "\n[yellow]Unknown charges leave resources unpriced; the agent never "
+            "substitutes a built-in rate.[/yellow]"
+        )
+        for note in notes.notes:
+            console.print(f"  [yellow]{note.capability}[/yellow]: {note.message}")
+            if note.remedy:
+                console.print(f"    {note.remedy}")
+
+
 @app.command("policy")
 def show_policy() -> None:
     """Print the read-only IAM policy the agent needs."""
@@ -337,12 +483,24 @@ def _print_report(result: Scan, limit: int = 15) -> None:
     summary.add_row("Monthly run rate", human_money(tco.monthly_run_rate))
     if tco.forecast_next_month is not None:
         summary.add_row("Forecast next month", human_money(tco.forecast_next_month))
+    if tco.list_price_monthly_cost > 0:
+        summary.add_row(
+            "TCO from AWS pricing",
+            f"{human_money(tco.list_price_monthly_cost)}/mo "
+            f"({tco.priced_resource_count} of "
+            f"{tco.priced_resource_count + tco.unpriced_resource_count} resources priced)",
+        )
+    savings_share = (
+        tco.savings_percent if tco.monthly_run_rate > 0 else tco.list_price_savings_percent
+    )
     summary.add_row(
         "Identified savings",
-        f"[green]{human_money(tco.identified_monthly_savings)}/mo "
-        f"({tco.savings_percent:.1f}%)[/green]",
+        f"[green]{human_money(tco.identified_monthly_savings)}/mo ({savings_share:.1f}%)[/green]",
     )
-    summary.add_row("Optimized run rate", human_money(tco.optimized_monthly_run_rate))
+    if tco.monthly_run_rate > 0:
+        summary.add_row("Optimized run rate", human_money(tco.optimized_monthly_run_rate))
+    elif tco.list_price_monthly_cost > 0:
+        summary.add_row("Optimized TCO", human_money(tco.list_price_optimized_monthly_cost) + "/mo")
     summary.add_row("Resources", str(len(result.resources)))
     console.print(Panel(summary, title="Total cost of ownership", expand=False))
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections.abc import Sequence
 
@@ -48,8 +49,67 @@ rather than guessing around it. The account summary lists what was unavailable.
 - Be direct and specific. A short answer with a concrete resource id and a real figure \
 beats a page of generic cost advice. Use markdown, keep tables small, and lead with the \
 answer rather than your process.
+- Write arithmetic as plain text, never as LaTeX or MathJax. No $$...$$, \\(...\\), \
+\\text{}, \\times or \\frac: the dashboard does not render them, and the dollar signs \
+collide with prices. Write "8 GiB x $0.08/GiB-month = $0.64/month" on its own line.
 - You are read-only. Recommend changes, and give the command that would make them, but \
 never claim to have made one."""
+
+
+# Models answer cost arithmetic in LaTeX no matter how firmly the prompt asks them not to.
+# The dashboard renders markdown, not math, so "$$\\text{Cost} = S \\times $0.10$$" reaches the
+# reader verbatim. Flatten the handful of constructs that show up in arithmetic; leave
+# anything else alone rather than mangling prose.
+_FRACTION = re.compile(r"\\(?:d|t)?frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}")
+_TEXT_WRAPPER = re.compile(r"\\(?:text|mathrm|mathbf|mathit|operatorname)\s*\{([^{}]*)\}")
+_DELIMITERS = re.compile(r"\$\$|\\\[|\\\]|\\\(|\\\)")
+_CODE_BLOCK = re.compile(r"(```.*?```|`[^`\n]*`)", re.DOTALL)
+_SYMBOLS = {
+    r"\times": "x",
+    r"\cdot": "x",
+    r"\div": "/",
+    r"\approx": "~",
+    r"\leq": "<=",
+    r"\geq": ">=",
+    r"\le": "<=",
+    r"\ge": ">=",
+    r"\pm": "+/-",
+    r"\left": "",
+    r"\right": "",
+    r"\qquad": " ",
+    r"\quad": " ",
+    r"\,": " ",
+    r"\;": " ",
+    r"\:": " ",
+    r"\!": "",
+    r"\%": "%",
+    r"\$": "$",
+}
+_MATH_MARKERS = re.compile(
+    "|".join(re.escape(token) for token in ("$$", r"\(", r"\[", r"\text", r"\frac", *_SYMBOLS))
+)
+
+
+def flatten_math(text: str) -> str:
+    """Rewrite LaTeX arithmetic as plain text the dashboard can display."""
+    if not _MATH_MARKERS.search(text):
+        return text
+    # Code spans are quoted deliberately, so leave their contents untouched.
+    parts = _CODE_BLOCK.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _flatten_segment(parts[index])
+    return "".join(parts)
+
+
+def _flatten_segment(segment: str) -> str:
+    segment = _FRACTION.sub(r"\1 / \2", segment)
+    segment = _TEXT_WRAPPER.sub(r"\1", segment)
+    segment = segment.replace("\\\\", "\n")
+    for command in sorted(_SYMBOLS, key=len, reverse=True):
+        segment = segment.replace(command, _SYMBOLS[command])
+    segment = _DELIMITERS.sub("", segment)
+    segment = re.sub(r"[ \t]{2,}", " ", segment)
+    return "\n".join(line.rstrip() for line in segment.split("\n"))
 
 
 class ToolInvocation(BaseModel):
@@ -126,7 +186,7 @@ class ChatAgent:
                 return reply
 
             if not turn.wants_tools:
-                reply.message = turn.text
+                reply.message = flatten_math(turn.text)
                 return reply
 
             allowed = turn.tool_calls[: max(0, self._max_tool_calls - spent)]

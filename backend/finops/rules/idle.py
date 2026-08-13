@@ -4,13 +4,31 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from finops.model import ACTION_STOP, ACTION_TERMINATE, Evidence, Finding, Remediation
+from finops.config import Thresholds
+from finops.model import ACTION_STOP, ACTION_TERMINATE, Evidence, Finding, Remediation, Resource
 from finops.rules.base import Rule, RuleContext, finding_for, register
 from finops.util import human_money
 
 # An instance needs to have existed for a while before "it has been quiet" means
 # anything; a freshly launched host is quiet because it is still being set up.
 MIN_AGE_DAYS = 3
+
+
+def looks_idle(instance: Resource, thresholds: Thresholds) -> bool:
+    """Whether this instance is doing no work at all, on CPU or on the network.
+
+    Low CPU alone does not mean idle. An EKS node forwarding gigabytes a day sits near zero
+    percent CPU while being entirely load bearing. The rightsizing rule asks this before
+    standing aside for the idle rule, so an instance can never fall between the two and end
+    up with no recommendation of ours at all.
+    """
+    if instance.state != "running":
+        return False
+    cpu_avg = instance.metrics.get("cpu_avg")
+    network = instance.metrics.get("network_bytes_per_day")
+    if cpu_avg is None or network is None:
+        return False
+    return cpu_avg < thresholds.cpu_idle_percent and network < thresholds.network_idle_bytes_per_day
 
 
 @register
@@ -30,16 +48,12 @@ class IdleEc2Instance(Rule):
             if age is not None and age < MIN_AGE_DAYS:
                 continue
 
-            cpu_avg = instance.metrics.get("cpu_avg")
+            if not looks_idle(instance, thresholds):
+                continue
+            # Guaranteed present by looks_idle; read again for the evidence below.
+            cpu_avg = instance.metrics["cpu_avg"]
             cpu_max = instance.metrics.get("cpu_max")
-            network = instance.metrics.get("network_bytes_per_day")
-            # Without utilization data there is no evidence, so no finding.
-            if cpu_avg is None or network is None:
-                continue
-            if cpu_avg >= thresholds.cpu_idle_percent:
-                continue
-            if network >= thresholds.network_idle_bytes_per_day:
-                continue
+            network = instance.metrics["network_bytes_per_day"]
 
             savings = ctx.monthly_cost(instance)
             instance_type = instance.attributes.get("instance_type", "unknown")

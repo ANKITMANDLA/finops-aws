@@ -30,7 +30,9 @@ logger = logging.getLogger(__name__)
 # Hard API limit for a single GetMetricData request.
 MAX_QUERIES_PER_CALL = 500
 DAILY_PERIOD_SECONDS = 86400
+HOURLY_PERIOD_SECONDS = 3600
 DAYS_PER_MONTH = 30.44
+BYTES_PER_MIB = 1024**2
 
 Aggregate = Literal["avg", "sum", "max", "min", "last"]
 
@@ -209,6 +211,53 @@ class MetricsCollector:
                         (network_in or 0.0) + (network_out or 0.0), 2
                     )
 
+            if resource.resource_type == "efs:file-system":
+                # Throughput is what EFS is provisioned and billed in, so convert the byte
+                # counts into MiB/s here rather than in every rule that reads them.
+                per_day = metrics.get("efs_metered_bytes_per_day")
+                if per_day is not None:
+                    metrics["efs_throughput_mibps_avg"] = round(
+                        per_day / DAILY_PERIOD_SECONDS / BYTES_PER_MIB, 4
+                    )
+                peak_hour = metrics.get("efs_peak_metered_bytes_per_hour")
+                if peak_hour is not None:
+                    metrics["efs_throughput_mibps_peak"] = round(
+                        peak_hour / HOURLY_PERIOD_SECONDS / BYTES_PER_MIB, 4
+                    )
+
+            if resource.resource_type == "ec2:transit-gateway-attachment":
+                # Data processing is charged once per direction, so both count.
+                total = _sum_present(metrics, "tgw_bytes_in_per_day", "tgw_bytes_out_per_day")
+                if total is not None:
+                    metrics["tgw_bytes_per_day"] = round(total, 2)
+                    metrics["tgw_bytes_processed_per_month_gb"] = round(
+                        total * DAYS_PER_MONTH / 1024**3, 4
+                    )
+
+            if resource.resource_type == "ec2:vpc-endpoint":
+                per_day = metrics.get("endpoint_bytes_per_day")
+                if per_day is not None:
+                    metrics["endpoint_bytes_processed_per_month_gb"] = round(
+                        per_day * DAYS_PER_MONTH / 1024**3, 4
+                    )
+
+            if resource.resource_type == "ec2:vpn-connection":
+                total = _sum_present(metrics, "vpn_bytes_in_per_day", "vpn_bytes_out_per_day")
+                if total is not None:
+                    metrics["vpn_bytes_per_day"] = round(total, 2)
+
+            if resource.resource_type == "sqs:queue":
+                # Every send, receive, delete, and empty poll is one billable request.
+                requests = _sum_present(
+                    metrics,
+                    "sqs_messages_sent_per_month",
+                    "sqs_messages_received_per_month",
+                    "sqs_messages_deleted_per_month",
+                    "sqs_empty_receives_per_month",
+                )
+                if requests is not None:
+                    metrics["sqs_requests_per_month"] = round(requests, 2)
+
             if resource.resource_type == "ebs:volume":
                 read_ops = metrics.get("volume_read_ops_per_day")
                 write_ops = metrics.get("volume_write_ops_per_day")
@@ -216,6 +265,12 @@ class MetricsCollector:
                     total = (read_ops or 0.0) + (write_ops or 0.0)
                     metrics["volume_ops_per_day"] = round(total, 2)
                     metrics["volume_iops_observed"] = round(total / DAILY_PERIOD_SECONDS, 4)
+
+
+def _sum_present(metrics: dict[str, float], *names: str) -> float | None:
+    """Add up whichever of these metrics CloudWatch actually returned."""
+    present = [metrics[name] for name in names if metrics.get(name) is not None]
+    return sum(present) if present else None
 
 
 def _reduce(values: Sequence[float], spec: MetricSpec) -> float | None:
@@ -259,6 +314,32 @@ def _ebs_specs(resource: Resource) -> list[MetricSpec]:
         ),
         MetricSpec(
             "volume_idle_seconds_per_day", "AWS/EBS", "VolumeIdleTime", dimensions, "Sum", "avg"
+        ),
+    ]
+
+
+def _efs_specs(resource: Resource) -> list[MetricSpec]:
+    dimensions = {"FileSystemId": resource.resource_id}
+    return [
+        MetricSpec("efs_metered_bytes_per_day", "AWS/EFS", "MeteredIOBytes", dimensions, "Sum"),
+        # Provisioned throughput has to cover the busiest hour, not the average day, so the
+        # peak is collected at its own period rather than derived from the daily figure.
+        MetricSpec(
+            "efs_peak_metered_bytes_per_hour",
+            "AWS/EFS",
+            "MeteredIOBytes",
+            dimensions,
+            "Sum",
+            "max",
+            period=HOURLY_PERIOD_SECONDS,
+        ),
+        MetricSpec(
+            "efs_client_connections_max",
+            "AWS/EFS",
+            "ClientConnections",
+            dimensions,
+            "Maximum",
+            "max",
         ),
     ]
 
@@ -320,6 +401,138 @@ def _nat_specs(resource: Resource) -> list[MetricSpec]:
             "nat_active_connections",
             "AWS/NATGateway",
             "ActiveConnectionCount",
+            dimensions,
+            "Maximum",
+            "max",
+        ),
+    ]
+
+
+def _transit_gateway_attachment_specs(resource: Resource) -> list[MetricSpec]:
+    gateway_id = resource.attributes.get("transit_gateway_id")
+    if not gateway_id:
+        return []
+    dimensions = {
+        "TransitGateway": gateway_id,
+        "TransitGatewayAttachment": resource.resource_id,
+    }
+    return [
+        MetricSpec(
+            "tgw_bytes_in_per_day", "AWS/TransitGateway", "BytesIn", dimensions, "Sum", "avg"
+        ),
+        MetricSpec(
+            "tgw_bytes_out_per_day", "AWS/TransitGateway", "BytesOut", dimensions, "Sum", "avg"
+        ),
+    ]
+
+
+def _vpc_endpoint_specs(resource: Resource) -> list[MetricSpec]:
+    if not resource.attributes.get("billable"):
+        return []
+    # PrivateLink names its dimensions with spaces, unlike every other namespace.
+    dimensions = {
+        "VPC Endpoint Id": resource.resource_id,
+        "Endpoint Type": resource.attributes.get("endpoint_type") or "Interface",
+    }
+    return [
+        MetricSpec(
+            "endpoint_bytes_per_day",
+            "AWS/PrivateLinkEndpoints",
+            "BytesProcessed",
+            dimensions,
+            "Sum",
+            "avg",
+        ),
+        MetricSpec(
+            "endpoint_active_connections",
+            "AWS/PrivateLinkEndpoints",
+            "ActiveConnections",
+            dimensions,
+            "Maximum",
+            "max",
+        ),
+    ]
+
+
+def _vpn_specs(resource: Resource) -> list[MetricSpec]:
+    dimensions = {"VpnId": resource.resource_id}
+    return [
+        MetricSpec("vpn_bytes_in_per_day", "AWS/VPN", "TunnelDataIn", dimensions, "Sum", "avg"),
+        MetricSpec("vpn_bytes_out_per_day", "AWS/VPN", "TunnelDataOut", dimensions, "Sum", "avg"),
+        # TunnelState averages 1 when every tunnel is up and 0 when all are down.
+        MetricSpec("vpn_tunnel_state_avg", "AWS/VPN", "TunnelState", dimensions, "Average"),
+    ]
+
+
+def _sns_specs(resource: Resource) -> list[MetricSpec]:
+    dimensions = {"TopicName": resource.resource_id}
+    return [
+        MetricSpec(
+            "sns_messages_per_month",
+            "AWS/SNS",
+            "NumberOfMessagesPublished",
+            dimensions,
+            "Sum",
+            "avg",
+            scale=DAYS_PER_MONTH,
+        ),
+        MetricSpec(
+            "sns_notifications_failed_per_day",
+            "AWS/SNS",
+            "NumberOfNotificationsFailed",
+            dimensions,
+            "Sum",
+            "avg",
+        ),
+    ]
+
+
+def _sqs_specs(resource: Resource) -> list[MetricSpec]:
+    dimensions = {"QueueName": resource.resource_id}
+    monthly = DAYS_PER_MONTH
+    return [
+        MetricSpec(
+            "sqs_messages_sent_per_month",
+            "AWS/SQS",
+            "NumberOfMessagesSent",
+            dimensions,
+            "Sum",
+            "avg",
+            scale=monthly,
+        ),
+        MetricSpec(
+            "sqs_messages_received_per_month",
+            "AWS/SQS",
+            "NumberOfMessagesReceived",
+            dimensions,
+            "Sum",
+            "avg",
+            scale=monthly,
+        ),
+        MetricSpec(
+            "sqs_messages_deleted_per_month",
+            "AWS/SQS",
+            "NumberOfMessagesDeleted",
+            dimensions,
+            "Sum",
+            "avg",
+            scale=monthly,
+        ),
+        # A poll that returns nothing is still a billable request, and a badly configured
+        # consumer can make this the largest number on the queue.
+        MetricSpec(
+            "sqs_empty_receives_per_month",
+            "AWS/SQS",
+            "NumberOfEmptyReceives",
+            dimensions,
+            "Sum",
+            "avg",
+            scale=monthly,
+        ),
+        MetricSpec(
+            "sqs_oldest_message_age_seconds",
+            "AWS/SQS",
+            "ApproximateAgeOfOldestMessage",
             dimensions,
             "Maximum",
             "max",
@@ -420,9 +633,15 @@ _SPEC_BUILDERS: dict[str, Callable[[Resource], list[MetricSpec]]] = {
     "elb:classic": _classic_elb_specs,
     "ec2:nat-gateway": _nat_specs,
     "rds:db-instance": _rds_specs,
+    "efs:file-system": _efs_specs,
     "lambda:function": _lambda_specs,
     "s3:bucket": _s3_specs,
     "dynamodb:table": _dynamodb_specs,
+    "ec2:transit-gateway-attachment": _transit_gateway_attachment_specs,
+    "ec2:vpc-endpoint": _vpc_endpoint_specs,
+    "ec2:vpn-connection": _vpn_specs,
+    "sns:topic": _sns_specs,
+    "sqs:queue": _sqs_specs,
 }
 
 

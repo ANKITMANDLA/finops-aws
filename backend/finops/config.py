@@ -94,6 +94,17 @@ class Thresholds(BaseModel):
     ebs_iops_overprovisioned_ratio: float = Field(
         0.30, description="Flag provisioned IOPS when observed peak stays under this fraction."
     )
+    efs_throughput_overprovisioned_ratio: float = Field(
+        0.50,
+        description="Flag EFS provisioned throughput when the busiest hour stays under this "
+        "fraction of it.",
+    )
+    efs_idle_connections: float = Field(
+        0.0, description="Max peak client connections for an EFS file system to count as unused."
+    )
+    efs_unused_min_age_days: int = Field(
+        30, description="Ignore new file systems; they may not be mounted yet."
+    )
     snapshot_stale_age_days: int = Field(90, description="Snapshot age before it looks orphaned.")
     ami_stale_age_days: int = Field(90, description="Unused AMI age before it looks orphaned.")
     elb_idle_requests_per_day: float = Field(
@@ -101,6 +112,18 @@ class Thresholds(BaseModel):
     )
     nat_idle_bytes_per_day: float = Field(
         1024 * 1024, description="Max daily bytes processed for an idle NAT Gateway."
+    )
+    endpoint_idle_bytes_per_day: float = Field(
+        1024 * 1024, description="Max daily bytes for an idle VPC interface endpoint."
+    )
+    tgw_attachment_idle_bytes_per_day: float = Field(
+        1024 * 1024, description="Max daily bytes for an idle transit gateway attachment."
+    )
+    vpn_idle_bytes_per_day: float = Field(
+        1024 * 1024, description="Max daily bytes for an unused VPN connection."
+    )
+    network_unused_min_age_days: int = Field(
+        14, description="Ignore new endpoints, attachments, and VPNs; they may not be wired up yet."
     )
     rds_idle_connections: float = Field(
         1.0, description="Max average DB connections for an idle database."
@@ -147,6 +170,16 @@ class Settings(BaseSettings):
     cost_lookback_days: int = Field(30, ge=1, le=365)
     metric_lookback_days: int = Field(14, ge=1, le=90)
     max_workers: int = Field(8, ge=1, le=32)
+
+    # --- Pricing ---
+    public_price_list: bool = Field(
+        True,
+        description=(
+            "When pricing:GetProducts is denied, read the same rates from the price list "
+            "files AWS publishes without authentication. One download per service and "
+            "region, cached on disk."
+        ),
+    )
 
     # --- Storage ---
     db_path: Path = Field(Path("data") / "finops.db")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+from finops.config import Thresholds
 from finops.instances import (
     GRAVITON_DISCOUNT,
     current_generation_equivalent,
@@ -19,12 +20,46 @@ from finops.model import (
     Evidence,
     Finding,
     Remediation,
+    Resource,
 )
 from finops.rules.base import Rule, RuleContext, finding_for, register
+from finops.rules.idle import looks_idle
 from finops.util import human_money
 
 # Below this monthly cost, a resize is not worth the change management.
 MIN_INTERESTING_MONTHLY_COST = 5.0
+
+
+def resize_target(instance: Resource, thresholds: Thresholds) -> str | None:
+    """The size this instance should drop to, or None if it is busy enough to keep.
+
+    Shared with the Graviton rule so that one instance never attracts two rival
+    recommendations for changing the same thing.
+    """
+    if instance.state != "running":
+        return None
+    cpu_p95 = instance.metrics.get("cpu_p95")
+    cpu_avg = instance.metrics.get("cpu_avg")
+    if cpu_p95 is None or cpu_avg is None:
+        return None
+    # Switching an instance off saves more than shrinking it, so where that is on the table
+    # it is the better finding. It is only on the table when the instance is quiet on the
+    # network too: a node at 1% CPU shifting gigabytes a day is small, not idle, and left to
+    # the idle rule it would receive no recommendation from us at all.
+    if looks_idle(instance, thresholds):
+        return None
+    if cpu_p95 >= thresholds.cpu_underutilized_percent:
+        return None
+    return smaller_instance_type(instance.attributes.get("instance_type") or "")
+
+
+def graviton_target(instance: Resource, instance_type: str) -> str | None:
+    """The ARM equivalent of a given size, if this instance could run on ARM at all."""
+    if instance.attributes.get("architecture") == "arm64":
+        return None
+    if not supports_graviton(instance.attributes.get("platform_details") or "Linux"):
+        return None
+    return graviton_equivalent(instance_type)
 
 
 @register
@@ -36,24 +71,13 @@ class UnderutilizedEc2Instance(Rule):
     title = "Under-utilized EC2 instance"
 
     def evaluate(self, ctx: RuleContext) -> Iterable[Finding]:
-        thresholds = ctx.thresholds
         for instance in ctx.of_type("ec2:instance"):
-            if instance.state != "running":
-                continue
-            cpu_p95 = instance.metrics.get("cpu_p95")
-            cpu_avg = instance.metrics.get("cpu_avg")
-            if cpu_p95 is None or cpu_avg is None:
-                continue
-            # Idle instances are a different, more valuable finding.
-            if cpu_avg < thresholds.cpu_idle_percent:
-                continue
-            if cpu_p95 >= thresholds.cpu_underutilized_percent:
-                continue
-
-            instance_type = instance.attributes.get("instance_type") or ""
-            smaller = smaller_instance_type(instance_type)
+            smaller = resize_target(instance, ctx.thresholds)
             if not smaller:
                 continue
+            cpu_p95 = instance.metrics["cpu_p95"]
+            cpu_avg = instance.metrics["cpu_avg"]
+            instance_type = instance.attributes.get("instance_type") or ""
             current_cost = ctx.monthly_cost(instance)
             if current_cost < MIN_INTERESTING_MONTHLY_COST:
                 continue
@@ -66,6 +90,38 @@ class UnderutilizedEc2Instance(Rule):
             # fallback when the exact target type has no published price.
             savings = (current_cost - smaller_cost) if smaller_cost else current_cost * 0.5
 
+            evidence = [
+                Evidence(label="p95 CPU", value=f"{cpu_p95:.1f}%"),
+                Evidence(label="Average CPU", value=f"{cpu_avg:.1f}%"),
+                Evidence(label="Current type", value=instance_type),
+                Evidence(label="Suggested type", value=smaller),
+                Evidence(label="Current cost", value=f"{human_money(current_cost)}/month"),
+            ]
+            detail = (
+                f"95th percentile CPU is {cpu_p95:.1f}% and the average is {cpu_avg:.1f}%. "
+                f"Moving to {smaller} halves the vCPU and memory while still leaving "
+                "substantial headroom above the observed peak. Check memory and network "
+                "requirements before resizing, since CPU alone does not tell the whole story."
+            )
+
+            # An ARM move is a second, larger prize on the same instance rather than a
+            # rival recommendation, so it is described here instead of being counted twice.
+            arm = graviton_target(instance, smaller)
+            arm_cost = ctx.pricing.ec2_instance_monthly(instance.region, arm) if arm else None
+            if arm and arm_cost is not None and smaller_cost and arm_cost < smaller_cost:
+                extra = smaller_cost - arm_cost
+                evidence.append(
+                    Evidence(
+                        label="Further on Graviton",
+                        value=f"{arm} saves {human_money(extra)}/month more",
+                    )
+                )
+                detail += (
+                    f" If the workload can be rebuilt for arm64, {arm} is the cheaper landing "
+                    f"place still: {human_money(extra)}/month beyond this resize. That is a "
+                    "project rather than a config change, so it is not counted here."
+                )
+
             yield finding_for(
                 instance,
                 rule_id=self.id,
@@ -73,19 +129,8 @@ class UnderutilizedEc2Instance(Rule):
                 category=self.category,
                 action=ACTION_RIGHTSIZE,
                 savings=savings,
-                detail=(
-                    f"95th percentile CPU is {cpu_p95:.1f}% and the average is {cpu_avg:.1f}%. "
-                    f"Moving to {smaller} halves the vCPU and memory while still leaving "
-                    "substantial headroom above the observed peak. Check memory and network "
-                    "requirements before resizing, since CPU alone does not tell the whole story."
-                ),
-                evidence=[
-                    Evidence(label="p95 CPU", value=f"{cpu_p95:.1f}%"),
-                    Evidence(label="Average CPU", value=f"{cpu_avg:.1f}%"),
-                    Evidence(label="Current type", value=instance_type),
-                    Evidence(label="Suggested type", value=smaller),
-                    Evidence(label="Current cost", value=f"{human_money(current_cost)}/month"),
-                ],
+                detail=detail,
+                evidence=evidence,
                 remediation=Remediation(
                     summary=(
                         "Stop the instance, change the instance type, and start it again. "
@@ -176,7 +221,12 @@ class PreviousGenerationInstance(Rule):
 
 @register
 class GravitonCandidate(Rule):
-    """ARM instances list around 20% cheaper for workloads that can be rebuilt."""
+    """ARM instances list around 20% cheaper for workloads that can be rebuilt.
+
+    Only instances that are the right size already. An under-utilized instance needs
+    resizing first, and that finding carries the ARM option as its next step, so raising a
+    second recommendation here would put two competing figures on one resource.
+    """
 
     id = "ec2.graviton_candidate"
     category = "rightsizing"
@@ -186,19 +236,16 @@ class GravitonCandidate(Rule):
         for instance in ctx.of_type("ec2:instance"):
             if instance.state != "running":
                 continue
-            if instance.attributes.get("architecture") == "arm64":
-                continue
-            platform = instance.attributes.get("platform_details") or "Linux"
-            if not supports_graviton(platform):
-                continue
-
             instance_type = instance.attributes.get("instance_type") or ""
-            replacement = graviton_equivalent(instance_type)
+            replacement = graviton_target(instance, instance_type)
             if not replacement:
                 continue
             current_cost = ctx.monthly_cost(instance)
             if current_cost < MIN_INTERESTING_MONTHLY_COST:
                 continue
+            if resize_target(instance, ctx.thresholds):
+                continue
+            platform = instance.attributes.get("platform_details") or "Linux"
 
             new_cost = ctx.pricing.ec2_instance_monthly(instance.region, replacement)
             savings = (

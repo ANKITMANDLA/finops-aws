@@ -97,6 +97,7 @@ CREATE TABLE IF NOT EXISTS findings (
     evidence_json TEXT NOT NULL DEFAULT '[]',
     remediation_json TEXT,
     tags_json TEXT NOT NULL DEFAULT '{}',
+    alternative_to TEXT,
     PRIMARY KEY (scan_id, finding_id)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_scan_savings
@@ -227,8 +228,8 @@ class ScanStore:
                     source, resource_arn, resource_id, resource_type, region,
                     estimated_monthly_savings, currency, confidence, implementation_effort,
                     risk, cost_basis, rollback_possible, detail, evidence_json,
-                    remediation_json, tags_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    remediation_json, tags_json, alternative_to
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -255,6 +256,7 @@ class ScanStore:
                         _dumps([e.model_dump(mode="json") for e in f.evidence]),
                         f.remediation.model_dump_json() if f.remediation else None,
                         _dumps(f.tags),
+                        f.alternative_to,
                     )
                     for f in scan.findings
                 ],
@@ -311,7 +313,8 @@ class ScanStore:
             stale = [
                 row["scan_id"]
                 for row in conn.execute(
-                    "SELECT scan_id FROM scans ORDER BY started_at DESC LIMIT -1 OFFSET ?",
+                    "SELECT scan_id FROM scans ORDER BY started_at DESC, scan_id DESC "
+                    "LIMIT -1 OFFSET ?",
                     (keep,),
                 )
             ]
@@ -324,14 +327,17 @@ class ScanStore:
     def list_scans(self, limit: int = 50) -> list[ScanMeta]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM scans ORDER BY started_at DESC LIMIT ?", (limit,)
+                # Ids are timestamp-prefixed, so they order two scans that share a
+                # started_at rather than leaving it to whatever order rows come back in.
+                "SELECT * FROM scans ORDER BY started_at DESC, scan_id DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [_row_to_meta(row) for row in rows]
 
     def latest_scan_id(self) -> str | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT scan_id FROM scans ORDER BY started_at DESC LIMIT 1"
+                "SELECT scan_id FROM scans ORDER BY started_at DESC, scan_id DESC LIMIT 1"
             ).fetchone()
         return row["scan_id"] if row else None
 
@@ -556,6 +562,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # mocked account carries.
         conn.execute("UPDATE scans SET dry_run = 1 WHERE account_alias LIKE '%dry run%'")
 
+    finding_columns = {row["name"] for row in conn.execute("PRAGMA table_info(findings)")}
+    if "alternative_to" not in finding_columns:
+        conn.execute("ALTER TABLE findings ADD COLUMN alternative_to TEXT")
+
 
 def _row_to_meta(row: sqlite3.Row) -> ScanMeta:
     return ScanMeta(
@@ -618,6 +628,7 @@ def _row_to_finding(row: sqlite3.Row) -> Finding:
         evidence=json.loads(row["evidence_json"]),
         remediation=(json.loads(row["remediation_json"]) if row["remediation_json"] else None),
         tags=json.loads(row["tags_json"]),
+        alternative_to=row["alternative_to"],
     )
 
 

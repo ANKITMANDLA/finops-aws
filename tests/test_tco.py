@@ -54,6 +54,66 @@ def test_optimized_run_rate_is_the_bill_minus_identified_savings():
     assert report.savings_percent == pytest.approx(9.86, abs=0.05)
 
 
+def test_cost_of_ownership_is_built_from_list_prices_when_the_bill_is_missing():
+    # Without ce:GetCostAndUsage the snapshot is empty, but the inventory is priced per
+    # resource, so a cost of ownership figure still exists.
+    resources = [
+        make_resource("i-1", monthly_cost=2242.56),
+        make_resource("i-2", monthly_cost=1121.28),
+        make_resource("fn-1", monthly_cost=None),
+    ]
+    findings = [make_finding("a", savings=1121.28, resource_arn="arn:1")]
+
+    empty_bill = CostSnapshot(period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+    report = build_tco_report(empty_bill, findings, resources)
+
+    assert report.monthly_run_rate == 0.0
+    assert report.list_price_monthly_cost == 3363.84
+    assert report.priced_resource_count == 2
+    assert report.unpriced_resource_count == 1
+    assert report.list_price_optimized_monthly_cost == 2242.56
+    assert report.list_price_savings_percent == pytest.approx(33.33, abs=0.01)
+
+
+def test_the_list_price_breakdown_splits_the_inventory_by_service_and_region():
+    # With no bill to divide up, the charts have to come from the priced inventory.
+    resources = [
+        make_resource("i-1", service="EC2", region="us-east-1", monthly_cost=600.0),
+        make_resource("fs-1", service="EFS", region="us-west-2", monthly_cost=300.0),
+        make_resource("fs-2", service="EFS", region="us-west-2", monthly_cost=100.0),
+        make_resource("fn-1", service="Lambda", region="us-east-1", monthly_cost=None),
+    ]
+    findings = [make_finding("a", service="EFS", savings=250.0, resource_arn="arn:fs-1")]
+
+    empty_bill = CostSnapshot(period_start=date(2026, 7, 1), period_end=date(2026, 7, 31))
+    report = build_tco_report(empty_bill, findings, resources)
+
+    assert [(item.key, item.amount, item.share) for item in report.list_price_by_service] == [
+        ("EC2", 600.0, 60.0),
+        ("EFS", 400.0, 40.0),
+    ]
+    # Savings sit beside the service they came from, since both use the same names.
+    assert next(i for i in report.list_price_by_service if i.key == "EFS").savings == 250.0
+    assert [(item.key, item.amount) for item in report.list_price_by_region] == [
+        ("us-east-1", 600.0),
+        ("us-west-2", 400.0),
+    ]
+
+
+def test_an_alternative_change_is_shown_but_not_added_to_the_total():
+    findings = [
+        make_finding("a", savings=200.0, category="rightsizing", resource_arn="arn:1"),
+        make_finding("b", savings=80.0, category="rightsizing", resource_arn="arn:1"),
+    ]
+    findings[1].alternative_to = findings[0].title
+
+    report = build_tco_report(snapshot(), findings, [])
+
+    assert report.identified_monthly_savings == 200.0
+    rightsizing = next(item for item in report.by_category if item.key == "Rightsizing")
+    assert rightsizing.amount == 200.0
+
+
 def test_savings_cannot_exceed_the_actual_bill():
     # A rule with a runaway estimate must not produce a negative optimized run rate.
     findings = [make_finding(savings=999_999.0, resource_arn="arn:1")]

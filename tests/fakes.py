@@ -194,44 +194,94 @@ class FakeCostExplorerClient:
         }
 
 
-def price_list_entry(usd: str, unit: str = "Hrs") -> str:
+def price_list_entry(
+    usd: str,
+    unit: str = "Hrs",
+    *,
+    usage_type: str = "TestUsage",
+    tiers: dict[str, str] | None = None,
+) -> str:
+    """One PriceList entry, shaped like the real thing including its usage type.
+
+    ``tiers`` maps beginRange to price for the volume-discounted charges AWS publishes as
+    several dimensions on one product.
+    """
+    dimensions = (
+        {
+            f"ABC.JRTCKXETXF.TIER{index}": {
+                "unit": unit,
+                "beginRange": begin,
+                "pricePerUnit": {"USD": price},
+            }
+            for index, (begin, price) in enumerate(tiers.items())
+        }
+        if tiers
+        else {
+            "ABC.JRTCKXETXF.6YS6EN2CT7": {
+                "unit": unit,
+                "beginRange": "0",
+                "pricePerUnit": {"USD": usd},
+            }
+        }
+    )
     return json.dumps(
         {
-            "product": {"productFamily": "Compute Instance"},
-            "terms": {
-                "OnDemand": {
-                    "ABC.JRTCKXETXF": {
-                        "priceDimensions": {
-                            "ABC.JRTCKXETXF.6YS6EN2CT7": {
-                                "unit": unit,
-                                "pricePerUnit": {"USD": usd},
-                            }
-                        }
-                    }
-                }
+            "product": {
+                "productFamily": "Compute Instance",
+                "attributes": {"usagetype": usage_type},
             },
+            "terms": {"OnDemand": {"ABC.JRTCKXETXF": {"priceDimensions": dimensions}}},
         }
     )
 
 
 class FakePricingClient:
-    """Price List API stub keyed by the instanceType/volumeApiName filter."""
+    """Price List API stub keyed by the most specific filter in the request.
 
-    def __init__(self, prices: dict[str, str] | None = None, *, fail: bool = False) -> None:
+    Prices are given as ``"0.08"``, as ``("0.08", "USW2-EBS:VolumeUsage.gp3")`` when the
+    lookup narrows on a usage type, or with the published unit as a third element.
+    """
+
+    def __init__(
+        self,
+        prices: dict[str, str | tuple[str, ...]] | None = None,
+        *,
+        fail: bool = False,
+    ) -> None:
         self.prices = prices or {}
         self.fail = fail
         self.call_count = 0
+        self.requests: list[dict[str, str]] = []
 
     def get_products(self, **kwargs: Any) -> dict[str, Any]:
         self.call_count += 1
         if self.fail:
             raise client_error("AccessDeniedException", "GetProducts")
         filters = {f["Field"]: f["Value"] for f in kwargs.get("Filters", [])}
-        lookup = (
-            filters.get("instanceType")
-            or filters.get("volumeApiName")
-            or filters.get("productFamily")
-            or ""
+        self.requests.append(filters)
+        lookup = next(
+            (
+                filters[field]
+                for field in (
+                    "instanceType",
+                    "volumeApiName",
+                    "group",
+                    "volumeType",
+                    # EFS publishes every storage tier under one product family.
+                    "storageClass",
+                    # Transit gateway and Client VPN charges have no product family at
+                    # all; the operation is the only thing that identifies them.
+                    "operation",
+                    "productFamily",
+                )
+                if field in filters
+            ),
+            "",
         )
-        price = self.prices.get(lookup)
-        return {"PriceList": [price_list_entry(price)] if price else []}
+        entry = self.prices.get(lookup)
+        if entry is None:
+            return {"PriceList": []}
+        published = (entry,) if isinstance(entry, str) else tuple(entry)
+        usage_type = published[1] if len(published) > 1 else "TestUsage"
+        unit = published[2] if len(published) > 2 else "Hrs"
+        return {"PriceList": [price_list_entry(published[0], unit, usage_type=usage_type)]}

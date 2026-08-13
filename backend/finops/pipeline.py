@@ -21,7 +21,7 @@ from finops.aws.costs import CostExplorer, CostSnapshot
 from finops.aws.errors import NoteCollector, graceful
 from finops.aws.metrics import MetricsCollector
 from finops.aws.native_recs import NativeRecommendations
-from finops.aws.pricing import PricingClient
+from finops.aws.pricing import build_pricing
 from finops.aws.session import AwsContext
 from finops.config import Settings, get_settings
 from finops.model import Finding, Scan, utcnow
@@ -117,7 +117,7 @@ def run_scan(
 
     # --- per-resource cost ---
     step("pricing", "Attributing cost to resources")
-    pricing = PricingClient(aws, notes)
+    pricing = build_pricing(aws, notes)
     attribute_costs(resources, snapshot, pricing)
 
     # --- findings ---

@@ -72,6 +72,7 @@ export interface Finding {
   evidence: Evidence[];
   remediation?: Remediation | null;
   tags: Record<string, string>;
+  alternative_to?: string | null;
 }
 
 export interface BreakdownItem {
@@ -98,8 +99,16 @@ export interface TcoReport {
   identified_monthly_savings: number;
   optimized_monthly_run_rate: number;
   savings_percent: number;
+  list_price_monthly_cost: number;
+  list_price_optimized_monthly_cost: number;
+  list_price_savings_percent: number;
+  priced_resource_count: number;
+  unpriced_resource_count: number;
   by_service: BreakdownItem[];
   by_region: BreakdownItem[];
+  // Absent on scans stored before list-price breakdowns existed.
+  list_price_by_service?: BreakdownItem[];
+  list_price_by_region?: BreakdownItem[];
   by_usage_type: BreakdownItem[];
   by_category: BreakdownItem[];
   by_effort: BreakdownItem[];

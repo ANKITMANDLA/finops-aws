@@ -8,6 +8,7 @@ gap stays visible.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 from finops.model import (
@@ -20,11 +21,16 @@ from finops.model import (
 from finops.rules.base import Rule, RuleContext, register
 from finops.util import human_money
 
-# Tags that answer "who pays for this". Matched case-insensitively.
+# Words that answer "who pays for this", matched as whole words anywhere in a tag key.
+# Organizations routinely namespace their tags — ``acme:business:owner``,
+# ``finance/cost-center``, ``Owner_Email`` — and a key that names an owner still names one
+# whatever it is prefixed with.
 OWNERSHIP_TAG_KEYS = ("owner", "team", "cost-center", "costcenter", "project", "application", "app")
 
 # AWS-managed tags are not evidence that a human labelled anything.
 _IGNORED_TAG_PREFIXES = ("aws:", "kubernetes.io/", "eks:", "elasticbeanstalk:")
+
+_WORD_BOUNDARY = re.compile(r"[^a-z0-9]+")
 
 
 def has_ownership_tag(tags: dict[str, str]) -> bool:
@@ -32,7 +38,12 @@ def has_ownership_tag(tags: dict[str, str]) -> bool:
         lowered = key.lower()
         if any(lowered.startswith(prefix) for prefix in _IGNORED_TAG_PREFIXES):
             continue
-        if lowered in OWNERSHIP_TAG_KEYS and value.strip():
+        if not value.strip():
+            continue
+        # "company:business:cost-center" becomes "-dish-business-cost-center-", so an
+        # ownership word only matches on word boundaries and never inside a longer one.
+        padded = f"-{_WORD_BOUNDARY.sub('-', lowered).strip('-')}-"
+        if any(f"-{word}-" in padded for word in OWNERSHIP_TAG_KEYS):
             return True
     return False
 

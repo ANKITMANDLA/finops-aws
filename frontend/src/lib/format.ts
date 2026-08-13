@@ -53,11 +53,19 @@ export function bytes(value: number): string {
 
 /** Metric values carry their unit in the name, so read it and format to match. */
 export function metricValue(key: string, value: number): string {
+  // A byte count already converted to gigabytes must not be re-scaled as raw bytes.
+  if (/_gb$/.test(key)) {
+    const suffix = /per_month/.test(key) ? "/month" : /per_day/.test(key) ? "/day" : "";
+    return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} GB${suffix}`;
+  }
   if (/bytes/.test(key)) {
-    const suffix = /per_day/.test(key) ? "/day" : "";
+    const suffix = /per_day/.test(key) ? "/day" : /per_hour/.test(key) ? "/hour" : "";
     return bytes(value) + suffix;
   }
   if (/percent|_pct$/.test(key)) return percent(value);
+  if (/mibps/.test(key)) {
+    return `${value.toLocaleString(undefined, { maximumFractionDigits: 2 })} MiB/s`;
+  }
   return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
 
@@ -94,11 +102,21 @@ export function relativeTime(value: string | null | undefined): string {
   return formatter.format(-Math.round(seconds / 2592000), "month");
 }
 
+/** Services whose API prefix is unreadable in capitals. */
+const SERVICE_LABELS: Record<string, string> = {
+  secretsmanager: "Secrets Manager",
+  cloudwatch: "CloudWatch",
+  "acm-pca": "ACM Private",
+  dynamodb: "DynamoDB",
+  lambda: "Lambda",
+  logs: "CloudWatch",
+};
+
 /** "ec2:instance" reads better as "EC2 instance" in a table cell. */
 export function humanizeType(resourceType: string): string {
   const [service, kind] = resourceType.split(":");
   const label = (kind ?? "").replace(/[-_]/g, " ");
-  return `${service.toUpperCase()} ${label}`.trim();
+  return `${SERVICE_LABELS[service] ?? service.toUpperCase()} ${label}`.trim();
 }
 
 export function titleCase(value: string): string {

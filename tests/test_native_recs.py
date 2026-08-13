@@ -7,8 +7,19 @@ from tests.factories import make_finding
 from tests.fakes import FakeAwsContext, client_error
 
 from finops.aws.errors import NoteCollector
-from finops.aws.native_recs import NativeRecommendations, _extract_savings, _humanize
-from finops.model import ACTION_PURCHASE_COMMITMENT, ACTION_RIGHTSIZE, make_finding_id
+from finops.aws.native_recs import (
+    NativeRecommendations,
+    _extract_savings,
+    _humanize,
+    _trusted_advisor_action,
+)
+from finops.model import (
+    ACTION_MODIFY_STORAGE,
+    ACTION_PURCHASE_COMMITMENT,
+    ACTION_RELEASE,
+    ACTION_RIGHTSIZE,
+    make_finding_id,
+)
 from finops.rules import merge_findings
 
 INSTANCE_ARN = "arn:aws:ec2:us-east-1:111122223333:instance/i-0abc"
@@ -394,6 +405,117 @@ def test_trusted_advisor_findings_carry_the_real_resource_identity(settings):
     assert finding.category == "rightsizing"
 
 
+class FakeCostOptimizationHubBackedClient:
+    """The newer checks that relay Cost Optimization Hub, whose columns lead with its own id."""
+
+    def describe_trusted_advisor_checks(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "checks": [
+                {
+                    "id": "c1z7kmr02n",
+                    "name": "Amazon EBS cost optimization recommendations for volumes",
+                    "category": "cost_optimizing",
+                    # The real column order, which puts a percentage before the amount and
+                    # five columns of plumbing before anything worth reading.
+                    "metadata": [
+                        "Status",
+                        "Region",
+                        "Recommendation Id",
+                        "Resource Id",
+                        "Resource ARN",
+                        "Current Resource Type",
+                        "Recommended Action",
+                        "Current Resource Summary",
+                        "Recommended Resource Summary",
+                        "Estimated Savings Percentage",
+                        "Estimated Monthly Cost",
+                        "Estimated Monthly Savings",
+                        "Currency Code",
+                    ],
+                }
+            ]
+        }
+
+    def describe_trusted_advisor_check_result(self, **kwargs: Any) -> dict[str, Any]:
+        return {
+            "result": {
+                "status": "warning",
+                "flaggedResources": [
+                    {
+                        "resourceId": "opaque-hash",
+                        "metadata": [
+                            "Yellow",
+                            "us-east-1",
+                            "1fc83e286af77b3c",
+                            "vol-04dec132e120282f1",
+                            "arn:aws:ec2:us-east-1:111122223333:volume/vol-04dec132e120282f1",
+                            "EbsVolume",
+                            "Rightsize",
+                            "150.0 GB Storage/4000.0 IOPS/125.0 MB/s Throughput",
+                            "150.0 GB Storage/3000.0 IOPS/125.0 MB/s Throughput",
+                            "29.41",
+                            "17.0",
+                            "5.0",
+                            "USD",
+                        ],
+                    }
+                ],
+            }
+        }
+
+
+def test_a_recommendation_id_is_never_mistaken_for_the_resource(settings):
+    """These checks list their own id first, and it matches nothing in the account.
+
+    A finding that cannot name its resource cannot be merged against our own view of that
+    resource, so its savings land in the total on top of ours for the same volume.
+    """
+    mapping = {"support": FakeCostOptimizationHubBackedClient()}
+    findings = NativeRecommendations(
+        RoutingAwsContext(mapping, settings), NoteCollector()
+    ).trusted_advisor()
+
+    finding = findings[0]
+    assert finding.resource_id == "vol-04dec132e120282f1"
+    assert finding.resource_arn == (
+        "arn:aws:ec2:us-east-1:111122223333:volume/vol-04dec132e120282f1"
+    )
+    # The region is only in the ARN and the metadata here, not on the flagged resource.
+    assert finding.region == "us-east-1"
+    assert finding.action_type == ACTION_MODIFY_STORAGE
+
+
+def test_a_savings_percentage_is_never_read_as_an_amount(settings):
+    """29.41% of a $17 volume is $5, and reporting it as $29.41 beggars the volume.
+
+    These checks report the percentage in the column before the amount, so taking the first
+    column whose heading mentions savings produced a figure larger than the whole resource.
+    """
+    mapping = {"support": FakeCostOptimizationHubBackedClient()}
+    findings = NativeRecommendations(
+        RoutingAwsContext(mapping, settings), NoteCollector()
+    ).trusted_advisor()
+
+    assert findings[0].estimated_monthly_savings == 5.0
+
+
+def test_the_evidence_keeps_the_columns_worth_reading(settings):
+    """Five columns of plumbing come before the action, the sizes, and the cost."""
+    mapping = {"support": FakeCostOptimizationHubBackedClient()}
+    findings = NativeRecommendations(
+        RoutingAwsContext(mapping, settings), NoteCollector()
+    ).trusted_advisor()
+
+    labels = [e.label for e in findings[0].evidence]
+    assert "Recommended Action" in labels
+    assert "Current Resource Summary" in labels
+    assert "Estimated Monthly Cost" in labels
+    # Identifiers and status are already on the finding, and the figure is its headline.
+    assert not {"Recommendation Id", "Resource ARN", "Status", "Estimated Monthly Savings"} & set(
+        labels
+    )
+
+
 def test_trusted_advisor_rightsizing_merges_with_our_own_rule(settings):
     """Two sources describing one instance must not be counted twice."""
     arn = "arn:aws:ec2:us-east-1:111122223333:instance/i-0abc123def456789"
@@ -407,6 +529,36 @@ def test_trusted_advisor_rightsizing_merges_with_our_own_rule(settings):
 
     assert len(merged) == 1
     assert merged[0].confidence == "high"
+
+
+@pytest.mark.parametrize(
+    ("check_name", "action", "category"),
+    [
+        ("Low Utilization Amazon EC2 Instances", ACTION_RIGHTSIZE, "rightsizing"),
+        (
+            "Amazon EC2 cost optimization recommendations for instances",
+            ACTION_RIGHTSIZE,
+            "rightsizing",
+        ),
+        ("Amazon EBS over-provisioned volumes", ACTION_MODIFY_STORAGE, "storage"),
+        (
+            "Amazon EBS cost optimization recommendations for volumes",
+            ACTION_MODIFY_STORAGE,
+            "storage",
+        ),
+        ("S3 Incomplete Multipart Upload Abort Configuration", ACTION_MODIFY_STORAGE, "storage"),
+        ("Unassociated Elastic IP Addresses", ACTION_RELEASE, "network"),
+        ("Underutilized Amazon EBS Volumes", ACTION_RIGHTSIZE, "rightsizing"),
+    ],
+)
+def test_each_cost_check_maps_to_the_change_it_actually_asks_for(check_name, action, category):
+    """A check that lands on the wrong action stops de-duplication from working.
+
+    Trusted Advisor's EBS checks ask for a smaller or cheaper volume. Reading them as
+    deletions meant our own EBS findings never merged with them, and the same change was
+    counted twice.
+    """
+    assert _trusted_advisor_action(check_name) == (action, category)
 
 
 def test_missing_support_plan_produces_a_helpful_note(settings):

@@ -77,6 +77,7 @@ dashboard reads only from there.
 | `finops scans` | List stored scans |
 | `finops advise [scan_id]` | Re-run only the LLM layer against a stored scan |
 | `finops prune` | Delete stored scans: `--keep N` by age, `--demo` for dry-run scans, `--empty` for runs that collected nothing, `--id` for one specific scan |
+| `finops prices` | Look up every list price the agent uses and show which source answered |
 | `finops serve` | Serve the API and, if built, the dashboard |
 | `finops policy` | Print the read-only IAM policy |
 
@@ -100,16 +101,19 @@ cd frontend && npm run dev   # terminal 2, http://localhost:5173
 - **Inventory** — filterable resource explorer; click any row for the full drill-in.
 - **Architecture** — the LLM's structural recommendations, each expandable to its
   rationale, steps, trade-offs, and the findings that justify it.
-- **Assistant** — ask questions about the account in plain language. See below.
 - **Trends** — scan-over-scan movement, so you can see whether waste is going up or down.
+
+The assistant is docked in the bottom-right corner of every page rather than living on one
+of its own; see below.
 
 Starting a scan from the dashboard runs it in the background: the UI keeps serving the
 previous scan while the new one collects.
 
 ## The assistant
 
-The Assistant tab is a chat that can look things up rather than recall them. It is given
-two sets of tools:
+The chat button in the corner of the dashboard opens an assistant that can look things up
+rather than recall them. It stays with you as you move between pages, so you can ask about
+a finding, go look at it, and carry on asking. It is given two sets of tools:
 
 - **Your scan** (`finops_*`) — the cost breakdown, findings with their evidence and
   remediation, and the inventory with CloudWatch metrics and tags. This is what lets it
@@ -134,7 +138,13 @@ continues without it.
 
 Configure the servers with `FINOPS_MCP_SERVERS` (JSON), turn the whole thing off with
 `FINOPS_MCP_ENABLED=false`, and cap how much work one question may do with
-`FINOPS_CHAT_MAX_TOOL_CALLS`. Conversations live in the browser tab and are not stored.
+`FINOPS_CHAT_MAX_TOOL_CALLS`. Conversations live in the browser tab and are not stored, so
+a reload starts fresh.
+
+An answer with a table or a walked-through calculation needs more room than a one-line
+reply, so the panel resizes: drag its top-left corner, or either of the top and left edges
+for one dimension at a time. The size is kept per browser and survives a reload;
+double-click the corner grip to go back to the default.
 
 Tool use needs a provider that supports it: Bedrock, Anthropic, OpenAI, or Gemini. Child
 process output from stdio servers goes to `mcp.log` beside the database.
@@ -145,18 +155,76 @@ This matters more than any feature, so the agent is explicit about it everywhere
 
 - **The headline total is the bill.** `ce:GetCostAndUsage` with the `AmortizedCost` metric,
   grouped by service, region, and usage type, filtered to exclude credits, refunds, and
-  tax. Per-resource estimates are never summed into a headline figure.
+  tax. Per-resource estimates are never summed into that headline figure.
+- **Cost of ownership from AWS pricing is a second, clearly separate figure.** Overview and
+  Savings each carry a "Cost of ownership from AWS pricing" frame: the inventory priced per
+  resource from the AWS Price List, with how many resources carry a price and what the
+  estate would list at after the identified changes. It is the only cost picture available
+  to a role denied Cost Explorer, and unlike the bill it can be attributed to a resource.
+  It excludes commitments, credits, negotiated discounts, and usage-priced services such as
+  Lambda and S3, so it reads higher than an invoice covered by Savings Plans. The two never
+  masquerade as each other.
 - **Per-resource cost is best-effort.** `GetCostAndUsageWithResources` gives real billed
   cost per resource, but it is opt-in and retains only 14 days. Without it, the agent
   estimates from the Price List API. Every figure carries a `cost_basis` — billed,
   allocated, list-price estimate, AWS recommendation, or heuristic — and the UI shows it.
+- **No price is ever hardcoded.** Every rate comes from AWS, for the resource's own region,
+  matched to the exact usage type the charge is published under, and cached in
+  `data/pricing-cache.json`. There is no built-in table of rates to fall back on, because a
+  stale rate is indistinguishable from a real one once it reaches a dashboard. If AWS does
+  not supply a rate the resource stays unpriced, the UI says "Not priced", and the scan
+  records why.
+
+  Rates are looked up two ways, in order:
+
+  1. **`pricing:GetProducts`**, the Price List Query API. This is public data and needs no
+     Cost Explorer access at all, so a role that cannot read your bill can still price your
+     resources.
+  2. **The price list files AWS publishes without authentication**, used when the API is
+     denied or unreachable. Same rates from the same source, reached over plain HTTPS with
+     no credentials. Each service and region is downloaded once, reduced to the on-demand
+     charges a scan asks about, and cached under `data/price-list/`. Reading stops before
+     the reserved instance terms, so even EC2 — a 450MB file — takes about ten seconds.
+     A scan that used this route says so in its capability notes. Turn it off with
+     `FINOPS_PUBLIC_PRICE_LIST=false` if you would rather see blanks than wait for a
+     download.
+
+  `finops prices --region eu-west-1` prints every rate the agent looks up, which source
+  answered, and what is missing if anything is. It is the quickest way to confirm the
+  pricing path works.
 - **Savings come from rules, not from the model.** Each finding is produced by a
   deterministic rule with cited evidence (metric values, resource state, configuration).
   The LLM only ever sees aggregates and the ranked findings, and is told not to invent
   dollar figures.
-- **No double counting.** Our rules overlap with Compute Optimizer and Cost Optimization
-  Hub. Findings are keyed by `(action, resource)` and merged, preferring AWS's own
-  estimate, so the same change is never counted twice.
+- **No double counting.** Our rules overlap with Compute Optimizer, Cost Optimization Hub,
+  and Trusted Advisor. Findings are keyed by `(action, resource)` and merged, so the same
+  change is never counted twice.
+- **The money always matches the steps.** When two sources describe one problem they often
+  price different fixes: Trusted Advisor's low-utilization check quotes what you save by
+  stopping an instance, while our rightsizing rule quotes what you save by halving it. The
+  finding that supplies the commands supplies the figure, and the other source's number is
+  shown as evidence of what it assumes. A saving is never larger than the change on screen
+  would deliver.
+- **Low CPU is not idle, and nothing falls between the rules.** An EKS node forwarding
+  gigabytes a day sits near zero percent CPU while being entirely load bearing. Switching an
+  instance off is only the better finding when it is quiet on the network as well, so the
+  rightsizing rule stands aside for the idle rule on exactly the instances the idle rule will
+  take, and resizes the rest. Instances used to fall through the gap between the two and end
+  up with no recommendation of ours, leaving an AWS check's "stop it" figure — priced at close
+  to the whole instance, with no commands — as the only claim on the node.
+- **One recommendation per resource.** An oversized x86 instance qualifies for both
+  rightsizing and a Graviton move, and showing both leaves two rival figures on one node.
+  The resize is the recommendation; the ARM option is described inside it as the next step,
+  with what it would save on top. Graviton is raised on its own only for instances that are
+  already the right size. Where two claims on one resource do survive — a rule and an AWS
+  check proposing different actions — the largest counts and the rest stay on screen marked
+  `alternative`, with their own figures, excluded from every total.
+- **One row per decision, not per node.** The nodes in an auto-scaling group share a `Name`
+  tag, so five identical workers produce five findings whose titles and figures are word for
+  word the same. The dashboard shows them as one row — the change, the fleet total, and the
+  figure per node — expanding to every instance it covers. Nothing is dropped or merged in
+  the store: the finding per resource is still there for attribution and for the API. This is
+  presentation only, so the total is unchanged whether rows are grouped or not.
 - **Savings never exceed the bill**, however enthusiastic the rules get.
 - **Ranking is value against effort.** A gp2-to-gp3 switch you can do this afternoon ranks
   above a Graviton migration with a bigger headline number.
@@ -168,9 +236,20 @@ Graviton candidates, underutilized), Auto Scaling groups, Lambda (ARM candidates
 provisioned concurrency).
 **Storage** — unattached EBS volumes, gp2-to-gp3, over-provisioned IOPS, stale snapshots
 and unused AMIs, S3 lifecycle and Intelligent-Tiering gaps, incomplete multipart uploads,
-versioning without expiry, log groups with unbounded retention.
+versioning without expiry, EFS file systems nothing mounts, cold EFS data never tiered out
+of Standard, EFS throughput provisioned far above the busiest hour, log groups with
+unbounded retention.
 **Network** — unassociated Elastic IPs, idle NAT Gateways, load balancers with no healthy
-targets or negligible traffic.
+targets or negligible traffic, interface VPC endpoints nothing calls, transit gateway
+attachments carrying no traffic, site-to-site VPN connections whose tunnels are down,
+Client VPN endpoints paying per associated subnet for access nobody uses.
+**Keys, secrets, and certificates** — customer managed KMS keys (AWS managed ones are free
+and are left out), keys still billing through their deletion window, Secrets Manager
+secrets, ACM certificates, and private certificate authorities, which bill every month
+until deleted whether they are enabled or not.
+**Messaging and registries** — SNS topics, SQS queues, ECR repositories, and CloudWatch
+alarms. Neither SNS nor SQS has a standing charge, so idle ones genuinely cost nothing;
+they are priced from measured request volume rather than assumed to be free.
 **Containers** — empty EKS clusters, node groups with no Spot capacity, many small clusters
 each paying a control plane fee.
 **Databases** — idle RDS instances, unused read replicas, gp2 storage, Graviton candidates,
@@ -186,6 +265,11 @@ needs enrollment, Compute Optimizer needs opt-in, and resource-level cost data n
 billing preference. Each of those is optional: the collector records a capability note
 explaining what was unavailable and why, the scan continues, and the dashboard shows the
 gap on the Overview page rather than pretending the report is complete.
+
+Cost Explorer is the largest of those gaps, because without it there is no bill to divide
+up. In its place the estate is priced per resource from the AWS Price List, so the cost of
+ownership figure, the split by service, and the split by region all still appear — labelled
+as list prices, since they know nothing of your commitments or discounts.
 
 ## Configuration
 
@@ -227,10 +311,11 @@ backend/finops/
   aws/collectors/   one module per service, registered in a pluggable registry
   aws/costs.py      Cost Explorer: usage, forecast, commitments, resource-level costs
   aws/metrics.py    batched CloudWatch GetMetricData
-  aws/pricing.py    Price List API with a disk cache and static fallbacks
+  aws/pricing.py    list price lookups, cached on disk; the only source of rates
+  aws/price_list.py AWS's published price list files, for roles denied the pricing API
   aws/native_recs.py Compute Optimizer, Cost Optimization Hub, Trusted Advisor
-  rules/            idle, rightsizing, storage, network, containers, database,
-                    commitments, governance
+  rules/            idle, rightsizing, storage, efs, network, connectivity,
+                    containers, database, commitments, governance
   tco.py            the report: totals, breakdowns, ranking
   agent/            providers (Bedrock | Anthropic | OpenAI | Gemini) with tool calling,
                     prompts, advisor, chat agent, MCP hub, scan lookup tools

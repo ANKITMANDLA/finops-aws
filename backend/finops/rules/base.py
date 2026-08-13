@@ -28,7 +28,7 @@ from finops.model import (
     make_finding_id,
     utcnow,
 )
-from finops.util import days_since
+from finops.util import days_since, human_money
 
 logger = logging.getLogger(__name__)
 
@@ -217,24 +217,62 @@ def merge_findings(findings: Iterable[Finding], *, min_savings: float = 0.0) -> 
 
     ranked = sorted(merged.values(), key=lambda f: f.estimated_monthly_savings, reverse=True)
     # Governance findings are informational and legitimately carry no dollar value.
-    return [
+    kept = [
         finding
         for finding in ranked
         if finding.estimated_monthly_savings >= min_savings or finding.category == "governance"
     ]
+    return mark_alternatives(kept)
+
+
+def mark_alternatives(findings: Sequence[Finding]) -> list[Finding]:
+    """Flag findings whose savings are already claimed by another change to the same thing.
+
+    Merging only catches two sources proposing the *same* action. A single instance can
+    also attract several different changes — halve it, and move it to Graviton — that are
+    both real, both worth doing, and not additive: the second saves a share of what is left
+    after the first, not a share of today's bill. Summing them promises money twice.
+
+    The largest claim on each resource is the one that counts. The rest keep their figures
+    and stay on screen, marked as alternatives, and are left out of the totals.
+    """
+    largest: dict[str, Finding] = {}
+    for finding in findings:
+        if not finding.resource_arn or finding.estimated_monthly_savings <= 0:
+            continue
+        held = largest.get(finding.resource_arn)
+        if held is None or finding.estimated_monthly_savings > held.estimated_monthly_savings:
+            largest[finding.resource_arn] = finding
+
+    for finding in findings:
+        counted = largest.get(finding.resource_arn or "")
+        if counted is not None and counted is not finding and finding.estimated_monthly_savings > 0:
+            finding.alternative_to = counted.title
+    return list(findings)
 
 
 def _merge_pair(first: Finding, second: Finding) -> Finding:
-    """Combine two views of the same issue, keeping the best part of each."""
+    """Combine two views of the same issue, keeping the best part of each.
+
+    Two sources can agree that a resource is wasteful and still price very different
+    changes: Trusted Advisor's low-utilization check quotes what you save by stopping an
+    instance, while our rightsizing rule quotes what you save by halving it. The finding
+    that supplies the steps therefore also supplies the figure, so the money on screen is
+    always the money that the instructions on screen would actually save. The other
+    source's number is kept as evidence rather than discarded.
+    """
     primary, secondary = sorted((first, second), key=lambda f: SOURCE_PRIORITY.index(f.source))
+    if not _has_commands(primary.remediation) and _has_commands(secondary.remediation):
+        primary, secondary = secondary, primary
 
     combined = primary.model_copy(deep=True)
-    # Keep whichever remediation actually tells the user what to run.
-    if not _has_commands(combined.remediation) and _has_commands(secondary.remediation):
-        combined.remediation = secondary.remediation
 
     seen = {(e.label, e.value) for e in combined.evidence}
     for evidence in secondary.evidence:
+        # The other source's own savings figure is reported below, attributed and explained.
+        # Copied across verbatim it reads as a second, contradictory answer to "how much".
+        if _quotes_savings(evidence.label):
+            continue
         if (evidence.label, evidence.value) not in seen:
             combined.evidence.append(evidence)
             seen.add((evidence.label, evidence.value))
@@ -245,11 +283,32 @@ def _merge_pair(first: Finding, second: Finding) -> Finding:
         )
         # Independent agreement from two sources raises confidence.
         combined.confidence = "high"
+        if not _same_money(primary, secondary):
+            combined.evidence.append(
+                Evidence(
+                    label=f"{_source_label(secondary.source)} estimates",
+                    value=(
+                        f"{human_money(secondary.estimated_monthly_savings)}/month "
+                        "for its own version of this change"
+                    ),
+                )
+            )
 
     if not combined.detail and secondary.detail:
         combined.detail = secondary.detail
     combined.tags = {**secondary.tags, **combined.tags}
     return combined
+
+
+def _quotes_savings(label: str) -> bool:
+    """Whether an evidence label is another source's answer to "how much would this save"."""
+    lowered = label.lower()
+    return "savings" in lowered or "estimated monthly cost" in lowered
+
+
+def _same_money(first: Finding, second: Finding) -> bool:
+    """Whether two estimates are close enough that quoting both would be noise."""
+    return abs(first.estimated_monthly_savings - second.estimated_monthly_savings) < 1.0
 
 
 def _has_commands(remediation: Remediation | None) -> bool:

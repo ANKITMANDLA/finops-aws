@@ -47,10 +47,18 @@ CE_SERVICE_HINTS: dict[str, tuple[str, ...]] = {
     "VPC": ("Virtual Private Cloud", "EC2 - Other"),
     "EKS": ("Kubernetes", "Container Service for Kubernetes"),
     "RDS": ("Relational Database Service",),
+    "EFS": ("Elastic File System",),
     "S3": ("Simple Storage Service",),
     "Lambda": ("Lambda",),
     "DynamoDB": ("DynamoDB",),
     "CloudWatch Logs": ("CloudWatch",),
+    "CloudWatch": ("CloudWatch",),
+    "KMS": ("Key Management Service",),
+    "Secrets Manager": ("Secrets Manager",),
+    "Certificate Manager": ("Certificate Manager", "Private Certificate Authority"),
+    "SNS": ("Simple Notification Service",),
+    "SQS": ("Simple Queue Service",),
+    "ECR": ("EC2 Container Registry", "Elastic Container Registry"),
     "Reserved Instances": ("Elastic Compute Cloud",),
     "Savings Plans": ("Elastic Compute Cloud",),
 }
@@ -75,14 +83,21 @@ def build_tco_report(
     """Combine billed cost, identified savings, and inventory into one report."""
     total = snapshot.total_cost
     monthly_run_rate = snapshot.monthly_run_rate
-    identified = sum(f.estimated_monthly_savings for f in findings)
+    # Alternatives are other ways to save money that is already counted elsewhere, so they
+    # are shown but never added in.
+    counted = [f for f in findings if f.counts_toward_total]
+    identified = sum(f.estimated_monthly_savings for f in counted)
     # Savings cannot exceed the bill, however enthusiastic the rules are.
     identified = min(identified, monthly_run_rate) if monthly_run_rate > 0 else identified
 
     cost_keys = list(snapshot.service_totals)
     savings_by_service = _sum_savings(
-        findings, lambda f: _match_cost_key(f.service, cost_keys) or f.service
+        counted, lambda f: _match_cost_key(f.service, cost_keys) or f.service
     )
+    # Findings and inventory both use the collectors' service names, so the list-price
+    # breakdown needs no reconciliation.
+    list_price_total = sum(r.monthly_cost or 0.0 for r in resources)
+    list_price_savings = _sum_savings(counted, lambda f: f.service)
 
     report = TcoReport(
         period_start=snapshot.period_start,
@@ -102,10 +117,19 @@ def build_tco_report(
         savings_percent=percent(identified, monthly_run_rate),
         by_service=_breakdown(snapshot.service_totals, total, savings=savings_by_service),
         by_region=_breakdown(snapshot.region_totals, total),
+        list_price_by_service=_breakdown(
+            _sum_cost(resources, lambda r: r.service),
+            list_price_total,
+            savings=list_price_savings,
+        ),
+        list_price_by_region=_breakdown(_sum_cost(resources, lambda r: r.region), list_price_total),
         by_usage_type=_breakdown(snapshot.usage_type_totals, total, limit=MAX_USAGE_TYPES),
-        by_category=_savings_breakdown(findings, lambda f: f.category, CATEGORY_LABELS),
-        by_effort=_savings_breakdown(findings, lambda f: f.implementation_effort, EFFORT_LABELS),
+        by_category=_savings_breakdown(counted, lambda f: f.category, CATEGORY_LABELS),
+        by_effort=_savings_breakdown(counted, lambda f: f.implementation_effort, EFFORT_LABELS),
         daily_trend=_daily_trend(snapshot.daily_totals),
+        list_price_monthly_cost=round_money(list_price_total),
+        priced_resource_count=sum(1 for r in resources if r.monthly_cost is not None),
+        unpriced_resource_count=sum(1 for r in resources if r.monthly_cost is None),
         untagged_monthly_cost=round_money(_untagged_cost(resources)),
         commitment_coverage_percent=snapshot.commitments.blended_coverage_percent,
     )
@@ -170,6 +194,17 @@ def _breakdown(
             )
         )
     return items
+
+
+def _sum_cost(resources: Sequence[Resource], key) -> dict[str, float]:
+    """List-price cost per bucket, skipping buckets nothing could be priced in."""
+    totals: dict[str, float] = {}
+    for resource in resources:
+        if not resource.monthly_cost:
+            continue
+        bucket = key(resource)
+        totals[bucket] = totals.get(bucket, 0.0) + resource.monthly_cost
+    return totals
 
 
 def _sum_savings(findings: Sequence[Finding], key) -> dict[str, float]:

@@ -1,3 +1,4 @@
+import { useMemo } from "react";
 import { Link } from "react-router-dom";
 import {
   Area,
@@ -17,18 +18,28 @@ import {
 import { AXIS, ChartTooltip, GRID_STROKE, TreemapCell } from "@/components/charts";
 import CapabilityNotes from "@/components/CapabilityNotes";
 import NoBaselineNotice from "@/components/NoBaselineNotice";
+import TcoFrame from "@/components/TcoFrame";
 import { Badge, Button, Card, EmptyState, ErrorState, Spinner, Stat, Table, Td, Th } from "@/components/ui";
 import { api } from "@/lib/api";
 import { colorFor, money, moneyExact, percent, shortDate, signedPercent } from "@/lib/format";
+import { groupFindings, groupScope } from "@/lib/groups";
 import { useApi } from "@/lib/hooks";
-import type { Finding } from "@/lib/types";
 import { useScanContext } from "@/state/ScanContext";
 
 export default function Overview() {
   const { scan, loading, error, scanId, startScan, scanning, refresh } = useScanContext();
-  const findings = useApi(() => api.findings(scanId, { limit: 5 }), [scanId], {
+  // Fetched wide and grouped, so a fleet of identical nodes takes one row here rather than
+  // filling the whole list with the same recommendation.
+  const findings = useApi(() => api.findings(scanId, { limit: 500 }), [scanId], {
     enabled: Boolean(scan?.tco),
   });
+  const top = useMemo(
+    () =>
+      groupFindings(findings.data?.items ?? [])
+        .sort((a, b) => b.savings - a.savings)
+        .slice(0, 5),
+    [findings.data],
+  );
 
   if (loading && !scan) return <Spinner label="Loading scan…" />;
 
@@ -54,8 +65,17 @@ export default function Overview() {
   }
 
   const trend = tco.daily_trend.map((item) => ({ day: shortDate(item.key), amount: item.amount }));
-  const services = tco.by_service.map((item) => ({ name: item.key, value: item.amount }));
-  const regions = tco.by_region.slice(0, 8);
+  // Without Cost Explorer there is no bill to split up, so both breakdowns fall back to
+  // what the inventory lists at.
+  const billed = tco.by_service.length > 0;
+  const services = (billed ? tco.by_service : tco.list_price_by_service ?? []).map((item) => ({
+    name: item.key,
+    value: item.amount,
+  }));
+  const regions = (
+    tco.by_region.length ? tco.by_region : tco.list_price_by_region ?? []
+  ).slice(0, 8);
+  const breakdownSource = billed ? "billed cost" : "AWS list prices";
 
   return (
     <div className="space-y-5">
@@ -103,6 +123,8 @@ export default function Overview() {
           tone="good"
         />
       </div>
+
+      <TcoFrame report={tco} />
 
       <div className="grid gap-5 xl:grid-cols-3">
         <Card
@@ -152,7 +174,7 @@ export default function Overview() {
           )}
         </Card>
 
-        <Card title="Where the money goes" subtitle="Share of spend by service">
+        <Card title="Where the money goes" subtitle={`Share by service, from ${breakdownSource}`}>
           {services.length ? (
             <ResponsiveContainer width="100%" height={260}>
               <Treemap
@@ -172,7 +194,11 @@ export default function Overview() {
       </div>
 
       <div className="grid gap-5 xl:grid-cols-3">
-        <Card title="Cost by region" className="xl:col-span-1">
+        <Card
+          title="Cost by region"
+          subtitle={`From ${breakdownSource}`}
+          className="xl:col-span-1"
+        >
           {regions.length ? (
             <ResponsiveContainer width="100%" height={Math.max(180, regions.length * 32)}>
               <BarChart data={regions} layout="vertical" margin={{ left: 8, right: 16 }}>
@@ -219,7 +245,7 @@ export default function Overview() {
           }
           bodyClassName="p-0"
         >
-          {findings.data?.items.length ? (
+          {top.length ? (
             <Table>
               <thead>
                 <tr>
@@ -232,29 +258,32 @@ export default function Overview() {
                 </tr>
               </thead>
               <tbody>
-                {findings.data.items.map((finding: Finding) => (
-                  <tr key={finding.id} className="hover:bg-surface-2/50">
+                {top.map((group) => (
+                  <tr key={group.key} className="hover:bg-surface-2/50">
                     <Td align="right" className="font-medium text-good">
-                      {money(finding.estimated_monthly_savings)}
+                      {money(group.savings)}
+                      {group.members.length > 1 && (
+                        <span className="mt-0.5 block text-xs font-normal text-ink-faint">
+                          {money(group.each)} each
+                        </span>
+                      )}
                     </Td>
-                    <Td className="text-ink">{finding.title}</Td>
-                    <Td className="truncate font-mono text-xs">
-                      {finding.resource_id ?? finding.region ?? "account"}
-                    </Td>
+                    <Td className="text-ink">{group.lead.title}</Td>
+                    <Td className="truncate font-mono text-xs">{groupScope(group)}</Td>
                     <Td>
                       <div className="flex gap-1.5">
                         <Badge
                           tone={
-                            finding.implementation_effort === "low"
+                            group.lead.implementation_effort === "low"
                               ? "good"
-                              : finding.implementation_effort === "medium"
+                              : group.lead.implementation_effort === "medium"
                                 ? "warn"
                                 : "bad"
                           }
                         >
-                          {finding.implementation_effort}
+                          {group.lead.implementation_effort}
                         </Badge>
-                        <Badge tone="neutral">{finding.source}</Badge>
+                        <Badge tone="neutral">{group.lead.source}</Badge>
                       </div>
                     </Td>
                   </tr>
