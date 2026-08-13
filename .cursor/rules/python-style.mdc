@@ -1,0 +1,45 @@
+---
+description: Python conventions for the FinOps backend — typing, comments, error handling, and the money-safety habits that keep numbers defensible
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# Backend Python
+
+Ruff at 100 columns, Python 3.11, `from __future__ import annotations` at the top of every
+module. `E`, `F`, `I`, `UP`, `B`, `W` are selected; keep imports absolute (`from finops.… import`).
+
+## Numbers
+
+- No literal rate, price, or dollar amount outside `demo.py`. Rates come from `PricingClient`.
+- `None` means not measured and must survive as `None`. Do not write `or 0.0`, `get(key, 0)`, or
+  `float(value or 0)` in a code path that feeds a cost, a saving, or an attribution — a zero
+  there reads on the dashboard as "free" rather than as "unknown".
+- Round only at the boundary where the value is stored or displayed, never mid-calculation.
+- Constants get a name and a comment saying why that value, in the module that uses them.
+  Anything that decides whether a rule fires belongs in `config.Thresholds` instead.
+
+## Errors
+
+- Catch `(ClientError, BotoCoreError)` and only around the call that can fail. A broad `except`
+  that returns an empty list turns a denied permission into an empty service.
+- Failures a user should know about become capability notes; failures that are merely noisy go to
+  `logger.debug` with the identifier that failed.
+- `logger`, never `print`, outside `cli.py`'s own output.
+- `# noqa: BLE001` is acceptable only where isolating one component's failure is the point, and
+  carries a comment saying so.
+
+## Types and shape
+
+- Annotate every signature; prefer precise types and `X | None` over `Optional`, `Any` only for
+  genuinely untyped AWS payloads.
+- Pydantic models in `model.py`, dataclasses for internal context objects.
+- Module docstrings say what the module is for and what is easy to get wrong about the service it
+  covers. Public helpers get a one-line docstring; private ones get one when the name is not
+  enough.
+
+## Comments
+
+A comment explains a constraint, a trade-off, or a fact about AWS the code cannot state — why a
+threshold is what it is, why an API is called twice, why a value is excluded. Never narrate what
+the next line does, and never explain a change to a reviewer.

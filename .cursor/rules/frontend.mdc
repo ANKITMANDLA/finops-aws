@@ -1,0 +1,38 @@
+---
+description: Frontend conventions for the FinOps dashboard — types mirrored from Pydantic, shared primitives, formatting, and the backward compatibility the Trends page needs
+globs: frontend/src/**/*.{ts,tsx}
+alwaysApply: false
+---
+
+# Dashboard
+
+Vite + React + TypeScript + Tailwind + Recharts. Five views over one `ScanContext`, which owns
+the selected scan, health, job status, and polling. Import through the `@/` alias.
+
+## Data
+
+- New data means extending `lib/api.ts` and mirroring the Pydantic model in `lib/types.ts`.
+- Anything a stored older scan will not have must be optional in the type and handled as absent
+  in the view. The Trends page reads history, so a field assumed present breaks it.
+- Distinguish absent from unmeasured on screen: an unpriced resource shows as unpriced, never as
+  `$0`. Formatting `null` is `lib/format.ts`'s job — use `money`, `percent`, `bytes`,
+  `metricValue`, not inline `toFixed`.
+- Metric keys are matched by pattern in `metricValue` to decide the unit, so name derived metrics
+  consistently with the existing keys.
+
+## Components
+
+Build from the primitives in `components/ui.tsx` — `Card`, `Badge`, `cx`, the table and empty
+states — rather than fresh markup, and from `components/charts.tsx` for Recharts wrappers.
+Tailwind uses the project's semantic tokens (`ink`, `line`, `surface`, `good`, `warn`, `bad`,
+`accent`); do not introduce raw palette colours.
+
+## Presentation is not accounting
+
+Grouping in the Savings table is display only. Totals come from the findings as the backend sent
+them, so a grouped row shows the sum of its members and never replaces them.
+
+## Checks
+
+`npx tsc --noEmit` must pass, and `npm run build` before `finops serve` shows anything. Never run
+Prettier ad hoc — it rewraps at 80 columns and fights the existing style.

@@ -113,6 +113,22 @@ for AWS surfaces and `FakePricingClient` for rates. Some APIs moto does not impl
 (`describe_client_vpn_endpoints`, EFS `SizeInBytes`) are handled explicitly rather than
 worked around in the collector.
 
+## Skills and rules in `.cursor/`
+
+The multi-step work has a checklist, because the failure is always a step skipped rather than a
+step done wrong. `.cursor/skills/` holds four:
+
+| | |
+| --- | --- |
+| `add-aws-service` | The six places a service touches, from collector to a priced resource |
+| `add-finops-rule` | Thresholds, evidence, remediation, and deciding overlap with other rules |
+| `finops-change-done` | The four checks, plus what else to run given what changed |
+| `finops-code-review` | Reviewing for the defects that leave a wrong number on the dashboard |
+
+`.cursor/rules/` holds the file-scoped conventions that this file states in summary:
+`python-style.mdc` for `backend/`, `tests.mdc` for `tests/`, `frontend.mdc` for `frontend/src/`.
+They load with the files they cover, so this file stays the short version.
+
 ## Local state, none of it in git
 
 `.env` holds the LLM key and AWS profile. `data/finops.db` is the scan history the Trends page

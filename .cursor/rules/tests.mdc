@@ -1,0 +1,49 @@
+---
+description: Test conventions for the FinOps agent — fixtures, fakes, naming, and the cases a rule or pricing test must cover
+globs: tests/**/*.py
+alwaysApply: false
+---
+
+# Tests
+
+No test reaches AWS and no test depends on the developer's environment. `conftest.py` injects
+fake credentials and strips `FINOPS_*` and `.env` autouse, both deliberately: a real API key in
+the environment must never decide whether an assertion holds. Do not undo either fixture, and do
+not read real config in a test.
+
+## What to use
+
+| Surface | Tool |
+| --- | --- |
+| AWS APIs in a collector | `moto`, against a seeded account |
+| Rates | `FakePricingClient`, stating the rates the assertion assumes |
+| Cost Explorer | `FakeCostExplorerClient` |
+| Model objects | `make_resource`, `make_finding`, `make_scan` from `factories.py` |
+| Rules | a `RuleContext` built directly from factory resources — rules never call AWS |
+
+Where moto does not implement an API, stub that one call explicitly. Never reshape production
+code to suit the mock.
+
+## What to cover
+
+The happy path is half a test. Also assert:
+
+- the boundary — just under the threshold produces nothing;
+- the unresolved rate — the resource stays unpriced, `monthly_cost is None`;
+- the missing metric — no finding rather than a finding priced at zero;
+- the deferral — when another rule owns this resource, this one stands aside;
+- the guard cases specific to the service, such as a resource owned by another account.
+
+Assert on the attributes and figures that rules and the UI depend on, not just on counts.
+
+## Naming
+
+Test names read as full sentences describing the case:
+
+```python
+def test_a_shared_transit_gateway_is_not_billed_to_this_account(...)
+def test_a_registry_whose_size_could_not_be_read_stays_unpriced(...)
+```
+
+They are the closest thing to a specification for a rule's edge cases, so name the behaviour,
+not the function under test.
