@@ -40,7 +40,7 @@ def has_ownership_tag(tags: dict[str, str]) -> bool:
             continue
         if not value.strip():
             continue
-        # "company:business:cost-center" becomes "-dish-business-cost-center-", so an
+        # "company:business:cost-center" becomes "-company-business-cost-center-", so an
         # ownership word only matches on word boundaries and never inside a longer one.
         padded = f"-{_WORD_BOUNDARY.sub('-', lowered).strip('-')}-"
         if any(f"-{word}-" in padded for word in OWNERSHIP_TAG_KEYS):
