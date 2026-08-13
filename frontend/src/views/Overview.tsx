@@ -10,14 +10,14 @@ import {
   ReferenceLine,
   ResponsiveContainer,
   Tooltip,
-  Treemap,
   XAxis,
   YAxis,
 } from "recharts";
 
-import { AXIS, ChartTooltip, GRID_STROKE, TreemapCell } from "@/components/charts";
+import { AXIS, ChartTooltip, GRID_STROKE } from "@/components/charts";
 import CapabilityNotes from "@/components/CapabilityNotes";
 import NoBaselineNotice from "@/components/NoBaselineNotice";
+import ServiceShare from "@/components/ServiceShare";
 import TcoFrame from "@/components/TcoFrame";
 import { Badge, Button, Card, EmptyState, ErrorState, Spinner, Stat, Table, Td, Th } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -175,21 +175,7 @@ export default function Overview() {
         </Card>
 
         <Card title="Where the money goes" subtitle={`Share by service, from ${breakdownSource}`}>
-          {services.length ? (
-            <ResponsiveContainer width="100%" height={260}>
-              <Treemap
-                data={services}
-                dataKey="value"
-                stroke="none"
-                content={<TreemapCell />}
-                isAnimationActive={false}
-              >
-                <Tooltip content={<ChartTooltip />} />
-              </Treemap>
-            </ResponsiveContainer>
-          ) : (
-            <p className="py-10 text-center text-sm text-ink-faint">No service costs returned.</p>
-          )}
+          <ServiceShare services={services} />
         </Card>
       </div>
 

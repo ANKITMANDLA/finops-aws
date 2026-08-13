@@ -4,6 +4,7 @@ import { dateTime, money, relativeTime } from "@/lib/format";
 import { useScanContext } from "@/state/ScanContext";
 
 import ChatWidget from "./ChatWidget";
+import Footer from "./Footer";
 import { Badge, Button, Select, Spinner, cx } from "./ui";
 
 const NAV = [
@@ -126,6 +127,8 @@ export default function Layout() {
         <main className="min-w-0 flex-1 px-6 py-6">
           <Outlet />
         </main>
+
+        <Footer />
       </div>
 
       {/* Outside <main> so a conversation is not remounted by route changes. */}
